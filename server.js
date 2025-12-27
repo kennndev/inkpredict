@@ -15,6 +15,9 @@ const app = express();
 app.use(express.json());
 app.use(cors());
 
+// Enable trust proxy for Vercel/proxies
+app.set('trust proxy', 1);
+
 // Rate limiting
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
