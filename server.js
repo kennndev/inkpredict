@@ -703,9 +703,42 @@ app.post('/api/admin/predictions', async (req, res) => {
       console.log('⏳ Waiting for transaction confirmation...');
       const receipt = await tx.wait();
 
-      // Get the market ID from the contract
-      const marketCount = await contract.marketCount();
-      const marketId = marketCount.toNumber() - 1; // Latest market
+      // Get the market ID from the MarketCreated event
+      let marketId = -1;
+
+      // Try to parse the event from the receipt
+      if (receipt.events && receipt.events.length > 0) {
+        const marketCreatedEvent = receipt.events.find(e => e.event === 'MarketCreated');
+        if (marketCreatedEvent && marketCreatedEvent.args) {
+          marketId = marketCreatedEvent.args.marketId.toNumber();
+        }
+      }
+
+      // Fallback: try to get from logs
+      if (marketId === -1 && receipt.logs && receipt.logs.length > 0) {
+        try {
+          const iface = new ethers.utils.Interface(CONTRACT_ABI);
+          for (const log of receipt.logs) {
+            try {
+              const parsed = iface.parseLog(log);
+              if (parsed.name === 'MarketCreated') {
+                marketId = parsed.args.marketId.toNumber();
+                break;
+              }
+            } catch (e) {
+              // Skip logs that don't match our ABI
+            }
+          }
+        } catch (e) {
+          console.error('Error parsing logs:', e.message);
+        }
+      }
+
+      // Final fallback: use marketCount
+      if (marketId === -1) {
+        const marketCount = await contract.marketCount();
+        marketId = marketCount.toNumber() - 1;
+      }
 
       console.log(`✅ Market deployed! Market ID: ${marketId}, TX: ${receipt.transactionHash}`);
 
