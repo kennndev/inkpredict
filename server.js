@@ -364,10 +364,81 @@ async function resolveExpiredMarkets() {
 // ============ API Endpoints ============
 
 /**
- * GET /api/markets - Get all active markets
+ * GET /api/markets - Get all active markets (merged from Supabase + Blockchain)
  */
 app.get('/api/markets', async (req, res) => {
   try {
+    const supabase = require('./supabase-client');
+
+    // Fetch active markets from Supabase (has questions, categories, etc.)
+    if (supabase) {
+      const { data: dbMarkets, error } = await supabase
+        .from('predictions')
+        .select('*')
+        .eq('deployed', true)
+        .eq('resolved', false)
+        .gt('deadline', new Date().toISOString())
+        .order('created_at', { ascending: false });
+
+      if (!error && dbMarkets && dbMarkets.length > 0) {
+        // Enrich with blockchain data (pools, odds)
+        const enrichedMarkets = await Promise.all(
+          dbMarkets.map(async (dbMarket) => {
+            try {
+              // Get blockchain data
+              const market = await contract.markets(dbMarket.market_id);
+              const [yesOdds, noOdds] = await contract.getOdds(dbMarket.market_id);
+
+              // Get current metrics
+              let currentMetric = 0;
+              if (dbMarket.category === 'TWITTER' && dbMarket.tweet_id) {
+                const metrics = await getTweetMetrics(dbMarket.tweet_id);
+                if (metrics) {
+                  const metricMap = {
+                    'like': metrics.likes,
+                    'retweet': metrics.retweets,
+                    'reply': metrics.replies,
+                    'view': metrics.views
+                  };
+                  currentMetric = metricMap[dbMarket.metric_type] || 0;
+                }
+              } else if (dbMarket.category === 'INK CHAIN') {
+                // For Ink Chain, we could fetch current metrics here if needed
+                currentMetric = 0;
+              }
+
+              return {
+                id: dbMarket.market_id.toString(),
+                question: dbMarket.question,
+                emoji: dbMarket.emoji,
+                category: dbMarket.category,
+                tweetId: dbMarket.tweet_id || market.tweetId,
+                tweetUrl: dbMarket.tweet_url,
+                targetMetric: dbMarket.target_metric.toString(),
+                metricType: dbMarket.metric_type,
+                deadline: Math.floor(new Date(dbMarket.deadline).getTime() / 1000).toString(),
+                yesPool: ethers.utils.formatUnits(market.yesPool, 6),
+                noPool: ethers.utils.formatUnits(market.noPool, 6),
+                resolved: market.resolved,
+                yesOdds: yesOdds,
+                noOdds: noOdds,
+                currentMetric: currentMetric,
+                createdAt: Math.floor(new Date(dbMarket.created_at).getTime() / 1000).toString()
+              };
+            } catch (err) {
+              console.error(`Error enriching market ${dbMarket.market_id}:`, err.message);
+              return null;
+            }
+          })
+        );
+
+        // Filter out null values (failed enrichments)
+        const validMarkets = enrichedMarkets.filter(m => m !== null);
+        return res.json({ success: true, markets: validMarkets });
+      }
+    }
+
+    // Fallback: fetch from blockchain only (old behavior)
     const activeMarketIds = await contract.getActiveMarkets();
     const markets = [];
 
@@ -378,16 +449,19 @@ app.get('/api/markets', async (req, res) => {
 
       markets.push({
         id: market.id.toString(),
+        question: `Will this reach ${market.targetMetric} ${market.metricType}s?`, // Fallback question
+        emoji: '🎯',
+        category: market.tweetId.startsWith('ink_') ? 'INK CHAIN' : 'TWITTER',
         tweetId: market.tweetId,
         targetMetric: market.targetMetric.toString(),
         metricType: market.metricType,
         deadline: market.deadline.toString(),
-        yesPool: ethers.utils.formatUnits(market.yesPool, 6), // USDC has 6 decimals
-        noPool: ethers.utils.formatUnits(market.noPool, 6), // USDC has 6 decimals
-        yesOdds: yesOdds.toString(),
-        noOdds: noOdds.toString(),
-        currentMetric: metrics ? metrics.likes : 0,
+        yesPool: ethers.utils.formatUnits(market.yesPool, 6),
+        noPool: ethers.utils.formatUnits(market.noPool, 6),
         resolved: market.resolved,
+        yesOdds: yesOdds,
+        noOdds: noOdds,
+        currentMetric: metrics ? (metrics.likes || metrics.retweets || metrics.replies || 0) : 0,
         createdAt: market.createdAt.toString()
       });
     }
