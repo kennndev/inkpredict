@@ -29,7 +29,10 @@ app.use(limiter);
 const twitterClient = new TwitterApi(process.env.TWITTER_BEARER_TOKEN);
 
 // Blockchain connection
-const provider = new ethers.providers.JsonRpcProvider(process.env.INK_CHAIN_RPC);
+const provider = new ethers.providers.JsonRpcProvider(process.env.INK_CHAIN_RPC, {
+  chainId: 763373,
+  name: 'ink-sepolia'
+});
 const adminWallet = new ethers.Wallet(process.env.ADMIN_PRIVATE_KEY, provider);
 const oracleWallet = new ethers.Wallet(process.env.ORACLE_PRIVATE_KEY, provider);
 
@@ -115,6 +118,19 @@ async function getTweetMetrics(tweetId) {
     return metrics;
   } catch (error) {
     console.error(`Error fetching metrics for tweet ${tweetId}:`, error.message);
+
+    // Mock data fallback if enabled
+    if (process.env.MOCK_TWITTER === 'true') {
+      console.log(`🎭 Returning mock data for tweet ${tweetId} (Fallback)`);
+      return {
+        likes: Math.floor(Math.random() * 10000),
+        retweets: Math.floor(Math.random() * 1000),
+        replies: Math.floor(Math.random() * 500),
+        bookmarks: Math.floor(Math.random() * 200),
+        views: Math.floor(Math.random() * 100000),
+        authorId: '123456789'
+      };
+    }
 
     // Return cached data even if expired, better than nothing
     if (cached) {
@@ -715,13 +731,16 @@ app.post('/api/admin/predictions', async (req, res) => {
 
 /**
  * POST /api/admin/create-market - Manual market creation
+ * Now also saves to Supabase for frontend visibility
  */
 app.post('/api/admin/create-market', async (req, res) => {
   try {
-    const { tweetId, targetMetric, metricType, durationHours } = req.body;
+    const { tweetId, targetMetric, metricType, durationHours, description } = req.body;
 
     const deadline = Math.floor(Date.now() / 1000) + (durationHours * 3600);
+    const deadlineISO = new Date(deadline * 1000).toISOString();
 
+    // Deploy to blockchain first
     const tx = await adminContract.createMarket(
       tweetId,
       targetMetric,
@@ -731,8 +750,49 @@ app.post('/api/admin/create-market', async (req, res) => {
 
     const receipt = await tx.wait();
 
+    // Get the market ID from the contract
+    const marketCount = await contract.marketCount();
+    const marketId = marketCount.toNumber() - 1;
+
+    console.log(`✅ Market deployed! Market ID: ${marketId}, TX: ${receipt.transactionHash}`);
+
+    // Save to Supabase (if available)
+    const supabase = require('./supabase-client');
+
+    if (supabase) {
+      try {
+        const predictionData = {
+          category: 'TWITTER', // Default to Twitter for backward compatibility
+          question: description || `Will this reach ${targetMetric} ${metricType}s?`,
+          emoji: '🎯',
+          tweet_id: tweetId,
+          tweet_url: `https://twitter.com/i/web/status/${tweetId}`,
+          target_metric: parseInt(targetMetric),
+          metric_type: metricType,
+          deadline: deadlineISO,
+          market_id: marketId,
+          deployed: true,
+          resolved: false,
+          created_by: 'admin'
+        };
+
+        const { error: supabaseError } = await supabase
+          .from('predictions')
+          .insert([predictionData]);
+
+        if (supabaseError) {
+          console.warn('⚠️ Failed to save to Supabase:', supabaseError.message);
+        } else {
+          console.log('✅ Market saved to Supabase');
+        }
+      } catch (dbError) {
+        console.warn('⚠️ Supabase save failed:', dbError.message);
+      }
+    }
+
     res.json({
       success: true,
+      marketId: marketId,
       transactionHash: receipt.transactionHash
     });
   } catch (error) {
