@@ -93,9 +93,26 @@ async function getTweetMetrics(tweetId) {
     return cached.data;
   }
 
-  // Fetch from Twitter API
+  // Try Twitter scraper first (no API limits)
   try {
-    console.log(`🐦 Fetching fresh data for tweet ${tweetId}`);
+    const { scrapeTweetMetrics } = require('./twitter-scraper');
+    console.log(`🌐 Scraping tweet ${tweetId}...`);
+    const metrics = await scrapeTweetMetrics(tweetId);
+
+    // Store in cache
+    metricsCache.set(tweetId, {
+      data: metrics,
+      timestamp: Date.now()
+    });
+
+    return metrics;
+  } catch (scraperError) {
+    console.log(`Scraper failed for ${tweetId}, trying Twitter API...`);
+  }
+
+  // Fallback to Twitter API
+  try {
+    console.log(`🐦 Fetching from Twitter API for tweet ${tweetId}`);
     const tweet = await twitterClient.v2.singleTweet(tweetId, {
       'tweet.fields': 'public_metrics,author_id'
     });
@@ -117,20 +134,7 @@ async function getTweetMetrics(tweetId) {
 
     return metrics;
   } catch (error) {
-    console.error(`Error fetching metrics for tweet ${tweetId}:`, error.message);
-
-    // Mock data fallback if enabled
-    if (process.env.MOCK_TWITTER === 'true') {
-      console.log(`🎭 Returning mock data for tweet ${tweetId} (Fallback)`);
-      return {
-        likes: Math.floor(Math.random() * 10000),
-        retweets: Math.floor(Math.random() * 1000),
-        replies: Math.floor(Math.random() * 500),
-        bookmarks: Math.floor(Math.random() * 200),
-        views: Math.floor(Math.random() * 100000),
-        authorId: '123456789'
-      };
-    }
+    console.error(`❌ Both scraper and API failed for tweet ${tweetId}:`, error.message);
 
     // Return cached data even if expired, better than nothing
     if (cached) {
@@ -138,6 +142,7 @@ async function getTweetMetrics(tweetId) {
       return cached.data;
     }
 
+    // Return null - let the caller handle it
     return null;
   }
 }
@@ -801,6 +806,121 @@ app.post('/api/admin/create-market', async (req, res) => {
   }
 });
 
+/**
+ * POST /api/admin/resolve-market - Manual market resolution (for testing)
+ * Allows admin to resolve a market before deadline for testing purposes
+ */
+app.post('/api/admin/resolve-market', async (req, res) => {
+  try {
+    const { marketId } = req.body;
+
+    if (marketId === undefined || marketId === null) {
+      return res.status(400).json({
+        success: false,
+        error: 'Market ID is required'
+      });
+    }
+
+    console.log(`🔮 Manual resolution requested for market #${marketId}`);
+
+    // Get market details
+    const market = await contract.markets(marketId);
+
+    if (market.resolved) {
+      return res.status(400).json({
+        success: false,
+        error: 'Market already resolved'
+      });
+    }
+
+    const tweetId = market.tweetId;
+    const targetMetric = market.targetMetric.toNumber();
+    const metricType = market.metricType;
+
+    console.log(`Tweet ID: ${tweetId}`);
+    console.log(`Target: ${targetMetric} ${metricType}s`);
+
+    // Fetch metrics based on prediction type
+    let actualMetric;
+
+    if (tweetId.startsWith('ink_')) {
+      // Ink Chain metric
+      console.log('⛓️ Fetching Ink Chain metrics...');
+      actualMetric = await getInkChainMetrics(metricType);
+    } else {
+      // Twitter metric
+      console.log('🐦 Fetching Twitter metrics...');
+      const metrics = await getTweetMetrics(tweetId);
+
+      if (!metrics) {
+        return res.status(500).json({
+          success: false,
+          error: 'Failed to fetch tweet metrics'
+        });
+      }
+
+      const metricMap = {
+        'like': metrics.likes,
+        'retweet': metrics.retweets,
+        'reply': metrics.replies,
+        'view': metrics.views,
+        'users': metrics.likes
+      };
+
+      actualMetric = metricMap[metricType.toLowerCase()] || 0;
+    }
+
+    console.log(`Actual: ${actualMetric} ${metricType}s`);
+
+    // Determine outcome
+    const outcome = actualMetric >= targetMetric;
+    console.log(`Result: ${outcome ? '✅ YES (Target Reached)' : '❌ NO (Target Not Reached)'}`);
+
+    // Resolve on-chain
+    console.log('⛓️ Submitting resolution to blockchain...');
+    const tx = await oracleContract.resolve(marketId, outcome, actualMetric);
+    console.log(`TX Hash: ${tx.hash}`);
+
+    const receipt = await tx.wait();
+    console.log(`✅ Resolved! Gas Used: ${receipt.gasUsed.toString()}`);
+
+    // Update Supabase if available
+    const supabase = require('./supabase-client');
+    if (supabase) {
+      try {
+        await supabase
+          .from('predictions')
+          .update({
+            resolved: true,
+            outcome: outcome,
+            final_metric: actualMetric
+          })
+          .eq('market_id', marketId);
+
+        console.log('✅ Updated Supabase');
+      } catch (dbError) {
+        console.warn('⚠️ Failed to update Supabase:', dbError.message);
+      }
+    }
+
+    res.json({
+      success: true,
+      marketId: marketId,
+      outcome: outcome,
+      actualMetric: actualMetric,
+      targetMetric: targetMetric,
+      transactionHash: receipt.transactionHash
+    });
+
+  } catch (error) {
+    console.error('Error resolving market:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
 // ============ Health Check ============
 
 app.get('/health', (req, res) => {
@@ -814,10 +934,7 @@ const PORT = process.env.PORT || 3001;
 // Only start server if running locally (not in Vercel)
 if (require.main === module) {
   app.listen(PORT, () => {
-    console.log(`🚀 InkPredict backend running on port ${PORT}`);
-    console.log(`📊 Contract: ${process.env.CONTRACT_ADDRESS}`);
-    console.log(`🔗 RPC: ${process.env.INK_CHAIN_RPC}`);
-    console.log(`⏰ Oracle running, will check markets every minute`);
+     console.log(`⏰ Oracle running, will check markets every minute`);
     console.log(`🐦 Twitter integration active`);
   });
 }
