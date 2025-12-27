@@ -627,7 +627,7 @@ app.post('/api/admin/predictions', async (req, res) => {
       question,
       emoji: emoji || '🎯',
       tweet_id: category === 'TWITTER' ? tweetId : null,
-      tweet_url: tweetUrl || null,
+      tweet_url: category === 'TWITTER' ? tweetUrl : null,
       ink_contract_address: category === 'INK CHAIN' ? (inkContractAddress || '0x0000000000000000000000000000000000000000') : null,
       target_metric: parseInt(targetMetric),
       metric_type: metricType,
