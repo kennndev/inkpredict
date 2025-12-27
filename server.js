@@ -60,9 +60,9 @@ const MARKET_DURATION_HOURS = 24; // Markets last 24 hours
 
 // ============ Twitter Integration ============
 
-// Cache for Twitter metrics (30 minute TTL to avoid rate limits)
+// Cache for tweet metrics (10 minute TTL)
 const metricsCache = new Map();
-const CACHE_TTL = 30 * 60 * 1000; // 30 minutes
+const CACHE_TTL = 10 * 60 * 1000; // 10 minutes
 
 /**
  * Fetch recent tweets from monitored accounts
@@ -86,6 +86,19 @@ async function fetchRecentTweets(userId) {
  * Get tweet metrics (with caching)
  */
 async function getTweetMetrics(tweetId) {
+  // Skip Twitter fetching for Ink Chain predictions
+  if (tweetId.startsWith('ink_')) {
+    console.log(`⛓️ Ink Chain prediction detected (${tweetId}), skipping Twitter metrics`);
+    return {
+      likes: 0,
+      retweets: 0,
+      replies: 0,
+      bookmarks: 0,
+      views: 0,
+      authorId: 'ink-chain'
+    };
+  }
+
   // Check cache first
   const cached = metricsCache.get(tweetId);
   if (cached && Date.now() - cached.timestamp < CACHE_TTL) {
@@ -934,7 +947,10 @@ const PORT = process.env.PORT || 3001;
 // Only start server if running locally (not in Vercel)
 if (require.main === module) {
   app.listen(PORT, () => {
-     console.log(`⏰ Oracle running, will check markets every minute`);
+    console.log(`🚀 InkPredict backend running on port ${PORT}`);
+    console.log(`📊 Contract: ${process.env.CONTRACT_ADDRESS}`);
+    console.log(`🔗 RPC: ${process.env.INK_CHAIN_RPC}`);
+    console.log(`⏰ Oracle running, will check markets every minute`);
     console.log(`🐦 Twitter integration active`);
   });
 }
