@@ -329,32 +329,108 @@ async function resolveExpiredMarkets() {
 
     console.log(`Found ${expiredMarketIds.length} expired markets`);
 
-    for (const marketId of expiredMarketIds) {
-      const market = await contract.markets(marketId);
-      const metrics = await getTweetMetrics(market.tweetId);
-
-      if (!metrics) {
-        console.error(`Failed to fetch metrics for market ${marketId}`);
-        continue;
-      }
-
-      const finalLikes = metrics.likes;
-      const outcome = finalLikes >= market.targetMetric;
-
-      console.log(`Resolving market ${marketId}:`);
-      console.log(`  Target: ${market.targetMetric}, Final: ${finalLikes}`);
-      console.log(`  Outcome: ${outcome ? 'YES' : 'NO'}`);
-
-      const tx = await oracleContract.resolve(marketId, outcome, finalLikes);
-      await tx.wait();
-
-      console.log(`✅ Market ${marketId} resolved!`);
-
-      // Add delay
-      await new Promise(resolve => setTimeout(resolve, 2000));
+    if (expiredMarketIds.length === 0) {
+      console.log('✅ No expired markets to resolve');
+      return { resolved: 0, errors: [] };
     }
+
+    let resolvedCount = 0;
+    const errors = [];
+
+    for (const marketId of expiredMarketIds) {
+      try {
+        const market = await contract.markets(marketId);
+        const tweetId = market.tweetId;
+        const targetMetric = market.targetMetric.toNumber();
+        const metricType = market.metricType;
+
+        console.log(`\n--- Resolving Market #${marketId} ---`);
+        console.log(`Tweet ID: ${tweetId}`);
+        console.log(`Target: ${targetMetric} ${metricType}s`);
+
+        let actualMetric = 0;
+
+        // Handle Ink Chain predictions
+        if (tweetId.startsWith('ink_')) {
+          console.log('⛓️ Fetching Ink Chain metrics...');
+          const inkMetrics = await getInkChainMetrics(metricType, market.inkContractAddress || null);
+          if (inkMetrics && inkMetrics.value !== undefined) {
+            actualMetric = typeof inkMetrics.value === 'number' ? inkMetrics.value : parseInt(inkMetrics.value);
+          } else {
+            console.error(`Failed to fetch Ink Chain metrics for market ${marketId}`);
+            errors.push({ marketId, error: 'Failed to fetch Ink Chain metrics' });
+            continue;
+          }
+        } else {
+          // Handle Twitter predictions
+          console.log('🐦 Fetching Twitter metrics...');
+          const metrics = await getTweetMetrics(tweetId);
+
+          if (!metrics) {
+            console.error(`Failed to fetch metrics for market ${marketId}`);
+            errors.push({ marketId, error: 'Failed to fetch tweet metrics' });
+            continue;
+          }
+
+          // Map metric type to actual value
+          const metricMap = {
+            'like': metrics.likes,
+            'retweet': metrics.retweets,
+            'reply': metrics.replies,
+            'view': metrics.views,
+            'bookmark': metrics.bookmarks || 0
+          };
+
+          actualMetric = metricMap[metricType.toLowerCase()] || 0;
+        }
+
+        const outcome = actualMetric >= targetMetric;
+
+        console.log(`Actual: ${actualMetric} ${metricType}s`);
+        console.log(`Outcome: ${outcome ? '✅ YES (Target Reached)' : '❌ NO (Target Not Reached)'}`);
+
+        // Resolve on-chain
+        console.log('⛓️ Submitting resolution to blockchain...');
+        const tx = await oracleContract.resolve(marketId, outcome, actualMetric);
+        console.log(`TX Hash: ${tx.hash}`);
+
+        const receipt = await tx.wait();
+        console.log(`✅ Market ${marketId} resolved! Gas Used: ${receipt.gasUsed.toString()}`);
+
+        // Update Supabase if available
+        const supabase = require('./supabase-client');
+        if (supabase) {
+          try {
+            await supabase
+              .from('predictions')
+              .update({
+                resolved: true,
+                outcome: outcome,
+                final_metric: actualMetric
+              })
+              .eq('market_id', marketId);
+            console.log('✅ Updated Supabase');
+          } catch (dbError) {
+            console.warn('⚠️ Failed to update Supabase:', dbError.message);
+          }
+        }
+
+        resolvedCount++;
+
+        // Add delay between resolutions
+        await new Promise(resolve => setTimeout(resolve, 2000));
+      } catch (error) {
+        console.error(`❌ Error resolving market ${marketId}:`, error.message);
+        errors.push({ marketId, error: error.message });
+        // Continue with next market
+      }
+    }
+
+    console.log(`\n🎉 Resolution complete! Resolved: ${resolvedCount}, Errors: ${errors.length}`);
+    return { resolved: resolvedCount, errors };
   } catch (error) {
     console.error('Error resolving markets:', error);
+    throw error;
   }
 }
 
@@ -364,6 +440,85 @@ async function resolveExpiredMarkets() {
 // ============ API Endpoints ============
 
 /**
+ * POST /api/oracle/resolve - Trigger automatic resolution of expired markets
+ * Protected by CRON_SECRET environment variable or Vercel cron header
+ */
+app.post('/api/oracle/resolve', async (req, res) => {
+  try {
+    // Verify authentication
+    // Option 1: Check for Vercel cron header (automatically added by Vercel)
+    const isVercelCron = req.headers['x-vercel-cron'] === '1';
+    
+    // Option 2: Check for custom CRON_SECRET
+    const cronSecret = req.headers['authorization']?.replace('Bearer ', '') || req.query.secret;
+    const expectedSecret = process.env.CRON_SECRET;
+
+    // Allow if: Vercel cron OR no secret required OR secret matches
+    if (!isVercelCron && expectedSecret && cronSecret !== expectedSecret) {
+      return res.status(401).json({
+        success: false,
+        error: 'Unauthorized - Missing or invalid cron secret'
+      });
+    }
+
+    console.log('🔮 Oracle resolution triggered via API');
+    const result = await resolveExpiredMarkets();
+
+    res.json({
+      success: true,
+      resolved: result.resolved,
+      errors: result.errors,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Error in oracle resolution endpoint:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * GET /api/oracle/resolve - Also support GET for easier cron configuration
+ */
+app.get('/api/oracle/resolve', async (req, res) => {
+  try {
+    // Verify authentication
+    // Option 1: Check for Vercel cron header (automatically added by Vercel)
+    const isVercelCron = req.headers['x-vercel-cron'] === '1';
+    
+    // Option 2: Check for custom CRON_SECRET
+    const cronSecret = req.query.secret;
+    const expectedSecret = process.env.CRON_SECRET;
+
+    // Allow if: Vercel cron OR no secret required OR secret matches
+    if (!isVercelCron && expectedSecret && cronSecret !== expectedSecret) {
+      return res.status(401).json({
+        success: false,
+        error: 'Unauthorized - Missing or invalid cron secret'
+      });
+    }
+
+    console.log('🔮 Oracle resolution triggered via API (GET)');
+    const result = await resolveExpiredMarkets();
+
+    res.json({
+      success: true,
+      resolved: result.resolved,
+      errors: result.errors,
+      timestamp: new Date().toISOString()
+    });
+  } catch (error) {
+    console.error('Error in oracle resolution endpoint:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
  * GET /api/markets - Get all active markets (merged from Supabase + Blockchain)
  */
 app.get('/api/markets', async (req, res) => {
@@ -371,13 +526,14 @@ app.get('/api/markets', async (req, res) => {
     const supabase = require('./supabase-client');
 
     // Fetch active markets from Supabase (has questions, categories, etc.)
+    // Only show markets that haven't expired yet (expired unresolved markets are shown in admin endpoint)
     if (supabase) {
       const { data: dbMarkets, error } = await supabase
         .from('predictions')
         .select('*')
         .eq('deployed', true)
         .eq('resolved', false)
-        .gt('deadline', new Date().toISOString())
+        .gt('deadline', new Date().toISOString()) // Only active markets
         .order('created_at', { ascending: false });
 
       if (!error && dbMarkets && dbMarkets.length > 0) {
@@ -987,6 +1143,126 @@ app.post('/api/admin/create-market', async (req, res) => {
     });
   } catch (error) {
     console.error('Error creating market:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * GET /api/admin/markets - Get all markets including expired unresolved ones (for admin dashboard)
+ */
+app.get('/api/admin/markets', async (req, res) => {
+  try {
+    const supabase = require('./supabase-client');
+
+    // Fetch ALL unresolved markets (including expired ones) for admin
+    if (supabase) {
+      const { data: dbMarkets, error } = await supabase
+        .from('predictions')
+        .select('*')
+        .eq('deployed', true)
+        .eq('resolved', false)
+        // No deadline filter - show all unresolved markets including expired
+        .order('created_at', { ascending: false });
+
+      if (!error && dbMarkets && dbMarkets.length > 0) {
+        // Enrich with blockchain data (pools, odds)
+        const enrichedMarkets = await Promise.all(
+          dbMarkets.map(async (dbMarket) => {
+            try {
+              // Get blockchain data
+              const market = await contract.markets(dbMarket.market_id);
+              const [yesOdds, noOdds] = await contract.getOdds(dbMarket.market_id);
+
+              // Get current metrics
+              let currentMetric = 0;
+              if (dbMarket.category === 'TWITTER' && dbMarket.tweet_id) {
+                const metrics = await getTweetMetrics(dbMarket.tweet_id);
+                if (metrics) {
+                  const metricMap = {
+                    'like': metrics.likes,
+                    'retweet': metrics.retweets,
+                    'reply': metrics.replies,
+                    'view': metrics.views
+                  };
+                  currentMetric = metricMap[dbMarket.metric_type] || 0;
+                }
+              } else if (dbMarket.category === 'INK CHAIN') {
+                // For Ink Chain, we could fetch current metrics here if needed
+                currentMetric = 0;
+              }
+
+              const deadlineTimestamp = Math.floor(new Date(dbMarket.deadline).getTime() / 1000);
+              const now = Math.floor(Date.now() / 1000);
+              const isExpired = deadlineTimestamp < now;
+
+              return {
+                id: dbMarket.market_id.toString(),
+                question: dbMarket.question,
+                emoji: dbMarket.emoji,
+                category: dbMarket.category,
+                tweetId: dbMarket.tweet_id || market.tweetId,
+                tweetUrl: dbMarket.tweet_url,
+                targetMetric: dbMarket.target_metric.toString(),
+                metricType: dbMarket.metric_type,
+                deadline: deadlineTimestamp.toString(),
+                yesPool: ethers.utils.formatUnits(market.yesPool, 6),
+                noPool: ethers.utils.formatUnits(market.noPool, 6),
+                resolved: market.resolved,
+                expired: isExpired && !market.resolved, // True if expired but not yet resolved
+                yesOdds: yesOdds,
+                noOdds: noOdds,
+                currentMetric: currentMetric,
+                createdAt: Math.floor(new Date(dbMarket.created_at).getTime() / 1000).toString()
+              };
+            } catch (err) {
+              console.error(`Error enriching market ${dbMarket.market_id}:`, err.message);
+              return null;
+            }
+          })
+        );
+
+        // Filter out null values (failed enrichments)
+        const validMarkets = enrichedMarkets.filter(m => m !== null);
+        return res.json({ success: true, markets: validMarkets });
+      }
+    }
+
+    // Fallback: fetch from blockchain only
+    const marketCount = await contract.marketCount();
+    const markets = [];
+
+    for (let i = 0; i < marketCount; i++) {
+      const market = await contract.markets(i);
+      if (market.resolved) continue; // Skip resolved markets
+
+      const metrics = await getTweetMetrics(market.tweetId);
+      const [yesOdds, noOdds] = await contract.getOdds(i);
+      const now = Math.floor(Date.now() / 1000);
+      const isExpired = market.deadline.toNumber() < now;
+
+      markets.push({
+        id: market.id.toString(),
+        question: `Will this reach ${market.targetMetric} ${market.metricType}s?`,
+        emoji: '🎯',
+        category: market.tweetId.startsWith('ink_') ? 'INK CHAIN' : 'TWITTER',
+        tweetId: market.tweetId,
+        targetMetric: market.targetMetric.toString(),
+        metricType: market.metricType,
+        deadline: market.deadline.toString(),
+        yesPool: ethers.utils.formatUnits(market.yesPool, 6),
+        noPool: ethers.utils.formatUnits(market.noPool, 6),
+        resolved: market.resolved,
+        expired: isExpired,
+        yesOdds: yesOdds,
+        noOdds: noOdds,
+        currentMetric: metrics ? (metrics.likes || metrics.retweets || metrics.replies || 0) : 0,
+        createdAt: market.createdAt.toString()
+      });
+    }
+
+    res.json({ success: true, markets });
+  } catch (error) {
+    console.error('Error fetching admin markets:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
