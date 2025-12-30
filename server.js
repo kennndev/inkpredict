@@ -258,7 +258,13 @@ async function getInkChainMetrics(metricType, contractAddress = null) {
       }
 
       default:
-        console.error(`Unknown metric type: ${metricType}`);
+        // Check if it's a Twitter metric being used for Ink Chain prediction
+        const twitterMetrics = ['like', 'likes', 'retweet', 'retweets', 'reply', 'replies', 'view', 'views', 'bookmark', 'bookmarks'];
+        if (twitterMetrics.includes(metricType.toLowerCase())) {
+          console.error(`⚠️ Twitter metric type "${metricType}" used for Ink Chain prediction. Ink Chain metrics: transactions, block_number, tvl, gas_price, active_wallets`);
+          return null;
+        }
+        console.error(`Unknown metric type: ${metricType}. Supported Ink Chain metrics: transactions, block_number, tvl, gas_price, active_wallets`);
         return null;
     }
   } catch (error) {
@@ -1360,13 +1366,23 @@ app.post('/api/admin/resolve-market', async (req, res) => {
     if (tweetId.startsWith('ink_')) {
       // Ink Chain metric
       console.log('⛓️ Fetching Ink Chain metrics...');
+      
+      // Check if Twitter metric type is being used for Ink Chain prediction
+      const twitterMetrics = ['like', 'likes', 'retweet', 'retweets', 'reply', 'replies', 'view', 'views', 'bookmark', 'bookmarks'];
+      if (twitterMetrics.includes(metricType.toLowerCase())) {
+        return res.status(400).json({
+          success: false,
+          error: `Invalid metric type "${metricType}" for Ink Chain prediction. Twitter metrics (like, retweet, etc.) cannot be used for Ink Chain predictions. Use Ink Chain metrics: transactions, block_number, tvl, gas_price, or active_wallets.`
+        });
+      }
+      
       const inkMetrics = await getInkChainMetrics(metricType, market.inkContractAddress || null);
       if (inkMetrics && inkMetrics.value !== undefined) {
         actualMetric = typeof inkMetrics.value === 'number' ? inkMetrics.value : parseInt(inkMetrics.value);
       } else {
         return res.status(500).json({
           success: false,
-          error: 'Failed to fetch Ink Chain metrics'
+          error: `Failed to fetch Ink Chain metrics for type "${metricType}". Supported types: transactions, block_number, tvl, gas_price, active_wallets`
         });
       }
     } else {
