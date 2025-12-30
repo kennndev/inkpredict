@@ -1302,12 +1302,20 @@ app.post('/api/admin/resolve-market', async (req, res) => {
     console.log(`Target: ${targetMetric} ${metricType}s`);
 
     // Fetch metrics based on prediction type
-    let actualMetric;
+    let actualMetric = 0;
 
     if (tweetId.startsWith('ink_')) {
       // Ink Chain metric
       console.log('⛓️ Fetching Ink Chain metrics...');
-      actualMetric = await getInkChainMetrics(metricType);
+      const inkMetrics = await getInkChainMetrics(metricType, market.inkContractAddress || null);
+      if (inkMetrics && inkMetrics.value !== undefined) {
+        actualMetric = typeof inkMetrics.value === 'number' ? inkMetrics.value : parseInt(inkMetrics.value);
+      } else {
+        return res.status(500).json({
+          success: false,
+          error: 'Failed to fetch Ink Chain metrics'
+        });
+      }
     } else {
       // Twitter metric
       console.log('🐦 Fetching Twitter metrics...');
@@ -1325,6 +1333,7 @@ app.post('/api/admin/resolve-market', async (req, res) => {
         'retweet': metrics.retweets,
         'reply': metrics.replies,
         'view': metrics.views,
+        'bookmark': metrics.bookmarks || 0,
         'users': metrics.likes
       };
 
