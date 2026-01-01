@@ -460,6 +460,7 @@ async function resolveExpiredMarkets() {
         const supabase = require('./supabase-client');
         if (supabase) {
           try {
+            // Update prediction
             await supabase
               .from('predictions')
               .update({
@@ -468,7 +469,79 @@ async function resolveExpiredMarkets() {
                 final_metric: actualMetric
               })
               .eq('market_id', marketId);
-            console.log('✅ Updated Supabase');
+            console.log('✅ Updated Supabase prediction');
+
+            // Update all bets for this market
+            const { data: bets } = await supabase
+              .from('user_bets')
+              .select('*')
+              .eq('market_id', marketId);
+
+            if (bets && bets.length > 0) {
+              console.log(`📊 Updating ${bets.length} bets for market ${marketId}...`);
+
+              const totalPool = market.yesPool.add(market.noPool);
+              const winningPool = outcome ? market.yesPool : market.noPool;
+
+              // Update each bet with outcome and payout
+              for (const bet of bets) {
+                const won = bet.position === outcome;
+                let payout = 0;
+
+                if (won && winningPool.gt(0)) {
+                  // Calculate proportional payout
+                  const betAmountWei = ethers.utils.parseUnits(bet.amount.toString(), 6);
+                  const share = betAmountWei.mul(ethers.BigNumber.from(10000)).div(winningPool);
+                  const winnings = totalPool.mul(share).div(10000);
+
+                  // Apply 2% platform fee
+                  const fee = winnings.mul(2).div(100);
+                  const netWinnings = winnings.sub(fee);
+
+                  payout = parseFloat(ethers.utils.formatUnits(netWinnings, 6));
+                }
+
+                await supabase
+                  .from('user_bets')
+                  .update({ won, payout })
+                  .eq('id', bet.id);
+              }
+
+              // Update user stats for all affected users
+              const uniqueUsers = [...new Set(bets.map(b => b.user_address))];
+              for (const userAddress of uniqueUsers) {
+                const { data: userBets } = await supabase
+                  .from('user_bets')
+                  .select('*')
+                  .eq('user_address', userAddress);
+
+                if (userBets && userBets.length > 0) {
+                  const totalBets = userBets.length;
+                  const totalWins = userBets.filter(b => b.won === true).length;
+                  const totalLosses = userBets.filter(b => b.won === false).length;
+                  const totalVolume = userBets.reduce((sum, b) => sum + parseFloat(b.amount || 0), 0);
+                  const totalWinnings = userBets.reduce((sum, b) => sum + parseFloat(b.payout || 0), 0);
+                  const winRate = totalBets > 0 ? (totalWins / totalBets) * 100 : 0;
+                  const lastBetAt = userBets.length > 0 ? userBets[userBets.length - 1].created_at : null;
+
+                  await supabase
+                    .from('user_stats')
+                    .upsert({
+                      user_address: userAddress,
+                      total_bets: totalBets,
+                      total_wins: totalWins,
+                      total_losses: totalLosses,
+                      total_volume: totalVolume,
+                      total_winnings: totalWinnings,
+                      win_rate: winRate,
+                      last_bet_at: lastBetAt,
+                      updated_at: new Date().toISOString()
+                    }, { onConflict: 'user_address' });
+                }
+              }
+
+              console.log(`✅ Updated ${bets.length} bets and ${uniqueUsers.length} user stats`);
+            }
           } catch (dbError) {
             console.warn('⚠️ Failed to update Supabase:', dbError.message);
           }
