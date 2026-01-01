@@ -211,25 +211,25 @@ async function getInkChainMetrics(metricType, contractAddress = null) {
           const latestBlock = await provider.getBlock('latest');
           const blockNumber = latestBlock.number;
           const uniqueAddresses = new Set();
-          
+
           // Check last 100 blocks (or fewer if chain is shorter)
           const startBlock = Math.max(0, blockNumber - 100);
           const blocksToCheck = Math.min(100, blockNumber + 1);
-          
+
           console.log(`Checking ${blocksToCheck} blocks (${startBlock} to ${blockNumber}) for active wallets...`);
-          
+
           // Process blocks in batches to avoid overwhelming the RPC
           const batchSize = 10;
           for (let i = startBlock; i <= blockNumber; i += batchSize) {
             const endBlock = Math.min(i + batchSize - 1, blockNumber);
             const promises = [];
-            
+
             for (let blockNum = i; blockNum <= endBlock; blockNum++) {
               promises.push(provider.getBlockWithTransactions(blockNum));
             }
-            
+
             const blocks = await Promise.all(promises);
-            
+
             for (const block of blocks) {
               if (block && block.transactions) {
                 for (const tx of block.transactions) {
@@ -239,13 +239,13 @@ async function getInkChainMetrics(metricType, contractAddress = null) {
                 }
               }
             }
-            
+
             // Small delay to avoid rate limiting
             if (i + batchSize <= blockNumber) {
               await new Promise(resolve => setTimeout(resolve, 100));
             }
           }
-          
+
           const count = uniqueAddresses.size;
           console.log(`Found ${count} unique active wallet addresses in recent blocks`);
           return { value: count, blockRange: `${startBlock}-${blockNumber}` };
@@ -507,7 +507,7 @@ app.post('/api/oracle/resolve', async (req, res) => {
     // Verify authentication
     // Option 1: Check for Vercel cron header (automatically added by Vercel)
     const isVercelCron = req.headers['x-vercel-cron'] === '1';
-    
+
     // Option 2: Check for custom CRON_SECRET
     const cronSecret = req.headers['authorization']?.replace('Bearer ', '') || req.query.secret;
     const expectedSecret = process.env.CRON_SECRET;
@@ -546,7 +546,7 @@ app.get('/api/oracle/resolve', async (req, res) => {
     // Verify authentication
     // Option 1: Check for Vercel cron header (automatically added by Vercel)
     const isVercelCron = req.headers['x-vercel-cron'] === '1';
-    
+
     // Option 2: Check for custom CRON_SECRET
     const cronSecret = req.query.secret;
     const expectedSecret = process.env.CRON_SECRET;
@@ -880,50 +880,145 @@ app.get('/api/stats', async (req, res) => {
 });
 
 /**
- * GET /api/leaderboard - Top winners
+ * GET /api/leaderboard - Top winners (from Supabase)
  */
 app.get('/api/leaderboard', async (req, res) => {
   try {
-    const marketCount = await contract.marketCount();
-    const userStats = new Map(); // address -> { wins, losses, volume }
+    const supabase = require('./supabase-client');
 
-    // Iterate through all markets to collect user stats
-    for (let i = 0; i < marketCount; i++) {
-      const market = await contract.markets(i);
-
-      // Skip unresolved markets
-      if (!market.resolved) continue;
-
-      // Get all users who bet on this market
-      // Note: This is inefficient for production - you'd want event indexing
-      // For now, we'll track users as we encounter them
-
-      // This is a simplified version - in production you'd use events/subgraph
-      // For demo purposes, we'll just return top bettors we know about
+    if (!supabase) {
+      return res.json({
+        success: true,
+        leaderboard: [],
+        message: 'Database not available'
+      });
     }
 
-    // For now, calculate leaderboard from recent activity
-    // In production, use The Graph or event indexing
-    const leaderboard = [];
+    // Query from the leaderboard view
+    const { data: leaderboard, error } = await supabase
+      .from('leaderboard')
+      .select('*')
+      .limit(100);
 
-    // Get unique addresses from recent transactions
-    // This is a workaround - proper implementation needs event logs
-    const addresses = new Set();
-
-    // Sample implementation - you'd improve this with proper event tracking
-    for (let i = 0; i < Math.min(marketCount.toNumber(), 10); i++) {
-      const market = await contract.markets(i);
-      if (market.yesPool.gt(0) || market.noPool.gt(0)) {
-        // Market has activity - we'd track users here via events
-      }
+    if (error) {
+      console.error('Error fetching leaderboard:', error);
+      return res.status(500).json({ success: false, error: error.message });
     }
 
     res.json({
       success: true,
-      leaderboard: [] // Return empty for now - needs event indexing for proper implementation
+      leaderboard: leaderboard || []
     });
   } catch (error) {
     console.error('Error fetching leaderboard:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * GET /api/user/:address/stats - Get user statistics
+ */
+app.get('/api/user/:address/stats', async (req, res) => {
+  try {
+    const supabase = require('./supabase-client');
+
+    if (!supabase) {
+      return res.json({
+        success: true,
+        stats: null,
+        message: 'Database not available'
+      });
+    }
+
+    const address = req.params.address.toLowerCase();
+
+    const { data: stats, error } = await supabase
+      .from('user_stats')
+      .select('*')
+      .eq('user_address', address)
+      .single();
+
+    if (error && error.code !== 'PGRST116') { // PGRST116 = no rows returned
+      console.error('Error fetching user stats:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+
+    res.json({
+      success: true,
+      stats: stats || {
+        user_address: address,
+        total_bets: 0,
+        total_wins: 0,
+        total_losses: 0,
+        total_volume: 0,
+        total_winnings: 0,
+        win_rate: 0
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching user stats:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * POST /api/user/bet - Record a bet placement (called from frontend)
+ */
+app.post('/api/user/bet', async (req, res) => {
+  try {
+    const supabase = require('./supabase-client');
+
+    if (!supabase) {
+      return res.json({
+        success: false,
+        error: 'Database not available'
+      });
+    }
+
+    const { userAddress, marketId, amount, position, transactionHash } = req.body;
+
+    // Validate required fields
+    if (!userAddress || marketId === undefined || !amount || position === undefined) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields: userAddress, marketId, amount, position'
+      });
+    }
+
+    // Get prediction_id from market_id
+    const { data: prediction, error: predError } = await supabase
+      .from('predictions')
+      .select('id')
+      .eq('market_id', marketId)
+      .single();
+
+    // Insert bet record
+    const { data: bet, error: betError } = await supabase
+      .from('user_bets')
+      .insert([{
+        user_address: userAddress.toLowerCase(),
+        market_id: marketId,
+        prediction_id: prediction?.id || null,
+        amount: parseFloat(amount),
+        position: position,
+        claimed: false,
+        created_at: new Date().toISOString()
+      }])
+      .select();
+
+    if (betError) {
+      console.error('Error recording bet:', betError);
+      return res.status(500).json({ success: false, error: betError.message });
+    }
+
+    console.log(`✅ Bet recorded: User ${userAddress}, Market ${marketId}, Amount ${amount} USDC, Position ${position ? 'YES' : 'NO'}`);
+
+    res.json({
+      success: true,
+      bet: bet[0]
+    });
+  } catch (error) {
+    console.error('Error recording bet:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
@@ -1366,7 +1461,7 @@ app.post('/api/admin/resolve-market', async (req, res) => {
     if (tweetId.startsWith('ink_')) {
       // Ink Chain metric
       console.log('⛓️ Fetching Ink Chain metrics...');
-      
+
       // Check if Twitter metric type is being used for Ink Chain prediction
       const twitterMetrics = ['like', 'likes', 'retweet', 'retweets', 'reply', 'replies', 'view', 'views', 'bookmark', 'bookmarks'];
       if (twitterMetrics.includes(metricType.toLowerCase())) {
@@ -1375,7 +1470,7 @@ app.post('/api/admin/resolve-market', async (req, res) => {
           error: `Invalid metric type "${metricType}" for Ink Chain prediction. Twitter metrics (like, retweet, etc.) cannot be used for Ink Chain predictions. Use Ink Chain metrics: transactions, block_number, tvl, gas_price, or active_wallets.`
         });
       }
-      
+
       const inkMetrics = await getInkChainMetrics(metricType, market.inkContractAddress || null);
       if (inkMetrics && inkMetrics.value !== undefined) {
         actualMetric = typeof inkMetrics.value === 'number' ? inkMetrics.value : parseInt(inkMetrics.value);
