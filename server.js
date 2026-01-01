@@ -180,7 +180,7 @@ async function getInkChainMetrics(metricType, contractAddress = null) {
         }
 
         // Otherwise return total network transactions (approximation)
-        return { value: blockNumber * 10, blockNumber }; // Rough estimate
+        return { value: blockNumber * 10, blockNumber }; 
       }
 
       case 'block_number': {
@@ -193,7 +193,7 @@ async function getInkChainMetrics(metricType, contractAddress = null) {
         if (contractAddress) {
           const balance = await provider.getBalance(contractAddress);
           const ethBalance = parseFloat(ethers.utils.formatEther(balance));
-          return { value: Math.floor(ethBalance * 1000), unit: 'ETH' }; // Convert to mETH
+          return { value: Math.floor(ethBalance * 1000), unit: 'ETH' }; 
         }
         return { value: 0, unit: 'ETH' };
       }
@@ -549,12 +549,10 @@ async function resolveExpiredMarkets() {
 
         resolvedCount++;
 
-        // Add delay between resolutions
         await new Promise(resolve => setTimeout(resolve, 2000));
       } catch (error) {
         console.error(`❌ Error resolving market ${marketId}:`, error.message);
         errors.push({ marketId, error: error.message });
-        // Continue with next market
       }
     }
 
@@ -577,15 +575,12 @@ async function resolveExpiredMarkets() {
  */
 app.post('/api/oracle/resolve', async (req, res) => {
   try {
-    // Verify authentication
-    // Option 1: Check for Vercel cron header (automatically added by Vercel)
+
     const isVercelCron = req.headers['x-vercel-cron'] === '1';
 
-    // Option 2: Check for custom CRON_SECRET
     const cronSecret = req.headers['authorization']?.replace('Bearer ', '') || req.query.secret;
     const expectedSecret = process.env.CRON_SECRET;
 
-    // Allow if: Vercel cron OR no secret required OR secret matches
     if (!isVercelCron && expectedSecret && cronSecret !== expectedSecret) {
       return res.status(401).json({
         success: false,
@@ -665,11 +660,10 @@ app.get('/api/markets', async (req, res) => {
         .select('*')
         .eq('deployed', true)
         .eq('resolved', false)
-        .gt('deadline', new Date().toISOString()) // Only active markets
+        .gt('deadline', new Date().toISOString()) 
         .order('created_at', { ascending: false });
 
       if (!error && dbMarkets && dbMarkets.length > 0) {
-        // Enrich with blockchain data (pools, odds)
         const enrichedMarkets = await Promise.all(
           dbMarkets.map(async (dbMarket) => {
             try {
@@ -691,7 +685,6 @@ app.get('/api/markets', async (req, res) => {
                   currentMetric = metricMap[dbMarket.metric_type] || 0;
                 }
               } else if (dbMarket.category === 'INK CHAIN') {
-                // For Ink Chain, we could fetch current metrics here if needed
                 currentMetric = 0;
               }
 
@@ -737,7 +730,7 @@ app.get('/api/markets', async (req, res) => {
 
       markets.push({
         id: market.id.toString(),
-        question: `Will this reach ${market.targetMetric} ${market.metricType}s?`, // Fallback question
+        question: `Will this reach ${market.targetMetric} ${market.metricType}s?`,
         emoji: '🎯',
         category: market.tweetId.startsWith('ink_') ? 'INK CHAIN' : 'TWITTER',
         tweetId: market.tweetId,
@@ -797,7 +790,7 @@ app.get('/api/market/:id', async (req, res) => {
               currentMetric = metricMap[dbMarket.metric_type] || 0;
             }
           } else if (dbMarket.category === 'INK CHAIN') {
-            currentMetric = 0; // Could fetch Ink Chain metrics here if needed
+            currentMetric = 0;
           }
 
           const marketData = {
@@ -823,12 +816,10 @@ app.get('/api/market/:id', async (req, res) => {
           return res.json({ success: true, market: marketData });
         } catch (err) {
           console.error(`Error enriching market ${marketId}:`, err.message);
-          // Fall through to blockchain-only fallback
         }
       }
     }
 
-    // Fallback: fetch from blockchain only
     const market = await contract.markets(marketId);
 
     if (market.deadline.toString() === '0') {
@@ -842,7 +833,7 @@ app.get('/api/market/:id', async (req, res) => {
       success: true,
       market: {
         id: market.id.toString(),
-        question: `Will this reach ${market.targetMetric} ${market.metricType}s?`, // Fallback question
+        question: `Will this reach ${market.targetMetric} ${market.metricType}s?`, 
         emoji: '🎯',
         category: market.tweetId.startsWith('ink_') ? 'INK CHAIN' : 'TWITTER',
         tweetId: market.tweetId,
@@ -881,7 +872,7 @@ app.get('/api/user/:address/bets', async (req, res) => {
       bets.push({
         marketId: marketId.toString(),
         tweetId: market.tweetId,
-        amount: ethers.utils.formatUnits(bet.amount, 6), // USDC has 6 decimals
+        amount: ethers.utils.formatUnits(bet.amount, 6), 
         position: bet.position,
         claimed: bet.claimed,
         resolved: market.resolved,
@@ -1011,7 +1002,7 @@ app.get('/api/user/:address/stats', async (req, res) => {
       .eq('user_address', address)
       .single();
 
-    if (error && error.code !== 'PGRST116') { // PGRST116 = no rows returned
+    if (error && error.code !== 'PGRST116') { 
       console.error('Error fetching user stats:', error);
       return res.status(500).json({ success: false, error: error.message });
     }
@@ -1140,10 +1131,9 @@ app.post('/api/admin/predictions', async (req, res) => {
 
     // For Ink Chain predictions, use a placeholder tweet ID and ensure contract address
     if (category === 'INK CHAIN') {
-      tweetId = `ink_${Date.now()}`; // Unique identifier for Ink predictions
+      tweetId = `ink_${Date.now()}`; 
     }
 
-    // Prepare prediction data for Supabase
     const predictionData = {
       category,
       question,
@@ -1329,13 +1319,12 @@ app.post('/api/admin/create-market', async (req, res) => {
 
     console.log(`✅ Market deployed! Market ID: ${marketId}, TX: ${receipt.transactionHash}`);
 
-    // Save to Supabase (if available)
     const supabase = require('./supabase-client');
 
     if (supabase) {
       try {
         const predictionData = {
-          category: 'TWITTER', // Default to Twitter for backward compatibility
+          category: 'TWITTER',
           question: description || `Will this reach ${targetMetric} ${metricType}s?`,
           emoji: '🎯',
           tweet_id: tweetId,
@@ -1388,7 +1377,6 @@ app.get('/api/admin/markets', async (req, res) => {
         .select('*')
         .eq('deployed', true)
         .eq('resolved', false)
-        // No deadline filter - show all unresolved markets including expired
         .order('created_at', { ascending: false });
 
       if (!error && dbMarkets && dbMarkets.length > 0) {
@@ -1414,7 +1402,6 @@ app.get('/api/admin/markets', async (req, res) => {
                   currentMetric = metricMap[dbMarket.metric_type] || 0;
                 }
               } else if (dbMarket.category === 'INK CHAIN') {
-                // For Ink Chain, we could fetch current metrics here if needed
                 currentMetric = 0;
               }
 
@@ -1435,7 +1422,7 @@ app.get('/api/admin/markets', async (req, res) => {
                 yesPool: ethers.utils.formatUnits(market.yesPool, 6),
                 noPool: ethers.utils.formatUnits(market.noPool, 6),
                 resolved: market.resolved,
-                expired: isExpired && !market.resolved, // True if expired but not yet resolved
+                expired: isExpired && !market.resolved,
                 yesOdds: yesOdds,
                 noOdds: noOdds,
                 currentMetric: currentMetric,
@@ -1460,7 +1447,7 @@ app.get('/api/admin/markets', async (req, res) => {
 
     for (let i = 0; i < marketCount; i++) {
       const market = await contract.markets(i);
-      if (market.resolved) continue; // Skip resolved markets
+      if (market.resolved) continue; 
 
       const metrics = await getTweetMetrics(market.tweetId);
       const [yesOdds, noOdds] = await contract.getOdds(i);
@@ -1511,7 +1498,6 @@ app.post('/api/admin/resolve-market', async (req, res) => {
 
     console.log(`🔮 Manual resolution requested for market #${marketId}`);
 
-    // Get market details
     const market = await contract.markets(marketId);
 
     if (market.resolved) {
@@ -1528,14 +1514,11 @@ app.post('/api/admin/resolve-market', async (req, res) => {
     console.log(`Tweet ID: ${tweetId}`);
     console.log(`Target: ${targetMetric} ${metricType}s`);
 
-    // Fetch metrics based on prediction type
     let actualMetric = 0;
 
     if (tweetId.startsWith('ink_')) {
-      // Ink Chain metric
       console.log('⛓️ Fetching Ink Chain metrics...');
 
-      // Check if Twitter metric type is being used for Ink Chain prediction
       const twitterMetrics = ['like', 'likes', 'retweet', 'retweets', 'reply', 'replies', 'view', 'views', 'bookmark', 'bookmarks'];
       if (twitterMetrics.includes(metricType.toLowerCase())) {
         return res.status(400).json({
@@ -1579,11 +1562,9 @@ app.post('/api/admin/resolve-market', async (req, res) => {
 
     console.log(`Actual: ${actualMetric} ${metricType}s`);
 
-    // Determine outcome
     const outcome = actualMetric >= targetMetric;
     console.log(`Result: ${outcome ? '✅ YES (Target Reached)' : '❌ NO (Target Not Reached)'}`);
 
-    // Resolve on-chain
     console.log('⛓️ Submitting resolution to blockchain...');
     const tx = await oracleContract.resolve(marketId, outcome, actualMetric);
     console.log(`TX Hash: ${tx.hash}`);
@@ -1638,7 +1619,6 @@ app.get('/health', (req, res) => {
 
 const PORT = process.env.PORT || 3001;
 
-// Only start server if running locally (not in Vercel)
 if (require.main === module) {
   app.listen(PORT, () => {
     console.log(`🚀 InkPredict backend running on port ${PORT}`);
