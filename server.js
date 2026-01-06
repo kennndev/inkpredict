@@ -861,7 +861,112 @@ app.get('/api/market/:id', async (req, res) => {
  */
 app.get('/api/user/:address/bets', async (req, res) => {
   try {
-    const address = req.params.address;
+    const address = req.params.address.toLowerCase();
+    const supabase = require('./supabase-client');
+
+    // Try to fetch from Supabase first (has question, emoji, category)
+    if (supabase) {
+      // First, get the bets
+      const { data: bets, error: betsError } = await supabase
+        .from('user_bets')
+        .select('*')
+        .eq('user_address', address)
+        .order('created_at', { ascending: false });
+
+      if (!betsError && bets && bets.length > 0) {
+        // Get the prediction_ids from bets
+        const predictionIds = bets
+          .filter(b => b.prediction_id)
+          .map(b => b.prediction_id);
+
+        // Fetch the related predictions
+        let predictionsMap = {};
+        if (predictionIds.length > 0) {
+          const { data: predictions, error: predError } = await supabase
+            .from('predictions')
+            .select('id, question, emoji, category, tweet_url')
+            .in('id', predictionIds);
+
+          if (!predError && predictions) {
+            predictions.forEach(p => {
+              predictionsMap[p.id] = p;
+            });
+          }
+        }
+
+        // Format the response with merged prediction data
+        const formattedBets = bets.map(bet => {
+          const prediction = predictionsMap[bet.prediction_id];
+          return {
+            marketId: bet.market_id.toString(),
+            amount: bet.amount,
+            position: bet.position,
+            claimed: bet.claimed || false,
+            resolved: bet.won !== null,
+            won: bet.won,
+            payout: bet.payout,
+            question: prediction?.question || null,
+            emoji: prediction?.emoji || null,
+            category: prediction?.category || null,
+            tweetUrl: prediction?.tweet_url || null,
+            createdAt: bet.created_at
+          };
+        });
+
+        console.log(`✅ Fetched ${formattedBets.length} bets for ${address}`);
+        console.log('Sample bet with question:', JSON.stringify(formattedBets[0], null, 2));
+        return res.json({ success: true, bets: formattedBets });
+      } else if (betsError) {
+        console.error('Supabase bets error:', betsError);
+
+        // Fallback: Manual JOIN - fetch bets and predictions separately
+        const { data: betsOnly, error: betsError } = await supabase
+          .from('user_bets')
+          .select('*')
+          .eq('user_address', address)
+          .order('created_at', { ascending: false });
+
+        if (!betsError && betsOnly && betsOnly.length > 0) {
+          // Get unique market_ids
+          const marketIds = [...new Set(betsOnly.map(b => b.market_id))];
+
+          // Fetch predictions for these markets
+          const { data: predictions, error: predError } = await supabase
+            .from('predictions')
+            .select('market_id, question, emoji, category, tweet_url')
+            .in('market_id', marketIds);
+
+          if (!predError && predictions) {
+            // Create a map for quick lookup
+            const predMap = {};
+            predictions.forEach(p => {
+              predMap[p.market_id] = p;
+            });
+
+            // Merge the data
+            const formattedBets = betsOnly.map(bet => ({
+              marketId: bet.market_id.toString(),
+              amount: bet.amount,
+              position: bet.position,
+              claimed: bet.claimed || false,
+              resolved: bet.won !== null,
+              won: bet.won,
+              payout: bet.payout,
+              question: predMap[bet.market_id]?.question || null,
+              emoji: predMap[bet.market_id]?.emoji || null,
+              category: predMap[bet.market_id]?.category || null,
+              tweetUrl: predMap[bet.market_id]?.tweet_url || null,
+              createdAt: bet.created_at
+            }));
+
+            console.log(`✅ Manual JOIN: Fetched ${formattedBets.length} bets for ${address}`);
+            return res.json({ success: true, bets: formattedBets });
+          }
+        }
+      }
+    }
+
+    // Fallback: fetch from blockchain only (old behavior)
     const marketIds = await contract.getUserMarkets(address);
     const bets = [];
 
@@ -1793,6 +1898,74 @@ app.post('/api/admin/resolve-market', async (req, res) => {
       success: false,
       error: error.message
     });
+  }
+});
+
+// ============ Live Activity Feed ============
+
+/**
+ * GET /api/activity/recent - Get recent betting activity for live feed
+ */
+app.get('/api/activity/recent', async (req, res) => {
+  try {
+    const supabase = require('./supabase-client');
+
+    if (!supabase) {
+      return res.json({ success: true, activities: [] });
+    }
+
+    // Fetch recent bets with prediction data
+    const { data: bets, error } = await supabase
+      .from('user_bets')
+      .select(`
+        id,
+        user_address,
+        market_id,
+        amount,
+        position,
+        won,
+        payout,
+        created_at,
+        predictions (
+          question
+        )
+      `)
+      .order('created_at', { ascending: false })
+      .limit(20);
+
+    if (error) {
+      console.error('Error fetching recent activity:', error);
+      return res.json({ success: true, activities: [] });
+    }
+
+    // Format activities for the feed
+    const activities = bets.map(bet => {
+      // Truncate user address for privacy
+      const shortAddress = `${bet.user_address.slice(0, 6)}...${bet.user_address.slice(-4)}`;
+
+      const activity = {
+        id: bet.id,
+        type: bet.won === true ? 'win' : 'bet',
+        user: shortAddress,
+        position: bet.position,
+        amount: bet.amount.toString(),
+        marketId: bet.market_id.toString(),
+        question: bet.predictions?.question || null,
+        timestamp: new Date(bet.created_at).getTime()
+      };
+
+      // If they won, add payout info
+      if (bet.won === true && bet.payout) {
+        activity.amount = bet.payout.toString();
+      }
+
+      return activity;
+    });
+
+    res.json({ success: true, activities });
+  } catch (error) {
+    console.error('Error in activity feed:', error);
+    res.json({ success: true, activities: [] });
   }
 });
 
