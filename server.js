@@ -1085,6 +1085,58 @@ app.get('/api/leaderboard', async (req, res) => {
 });
 
 /**
+ * GET /api/stats/platform - Get platform-wide statistics
+ */
+app.get('/api/stats/platform', async (req, res) => {
+  try {
+    const supabase = require('./supabase-client');
+
+    if (!supabase) {
+      return res.json({
+        totalMarkets: 0,
+        totalVolume: 0,
+        activeUsers: 0
+      });
+    }
+
+    // Get total markets count
+    const { count: totalMarkets } = await supabase
+      .from('predictions')
+      .select('*', { count: 'exact', head: true })
+      .eq('deployed', true);
+
+    // Get total volume from all bets
+    const { data: volumeData } = await supabase
+      .from('user_bets')
+      .select('amount');
+
+    const totalVolume = volumeData?.reduce((sum, bet) => sum + parseFloat(bet.amount || 0), 0) || 0;
+
+    // Get active users count (users who have placed at least one bet)
+    const { data: activeUsersData } = await supabase
+      .from('user_bets')
+      .select('user_address');
+
+    const activeUsers = activeUsersData
+      ? new Set(activeUsersData.map(bet => bet.user_address)).size
+      : 0;
+
+    res.json({
+      totalMarkets: totalMarkets || 0,
+      totalVolume: parseFloat(totalVolume.toFixed(2)),
+      activeUsers: activeUsers
+    });
+  } catch (error) {
+    console.error('Error fetching platform stats:', error);
+    res.json({
+      totalMarkets: 0,
+      totalVolume: 0,
+      activeUsers: 0
+    });
+  }
+});
+
+/**
  * GET /api/user/:address/stats - Get user statistics
  */
 app.get('/api/user/:address/stats', async (req, res) => {
