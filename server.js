@@ -180,7 +180,7 @@ async function getInkChainMetrics(metricType, contractAddress = null) {
         }
 
         // Otherwise return total network transactions (approximation)
-        return { value: blockNumber * 10, blockNumber }; 
+        return { value: blockNumber * 10, blockNumber };
       }
 
       case 'block_number': {
@@ -193,7 +193,7 @@ async function getInkChainMetrics(metricType, contractAddress = null) {
         if (contractAddress) {
           const balance = await provider.getBalance(contractAddress);
           const ethBalance = parseFloat(ethers.utils.formatEther(balance));
-          return { value: Math.floor(ethBalance * 1000), unit: 'ETH' }; 
+          return { value: Math.floor(ethBalance * 1000), unit: 'ETH' };
         }
         return { value: 0, unit: 'ETH' };
       }
@@ -660,7 +660,7 @@ app.get('/api/markets', async (req, res) => {
         .select('*')
         .eq('deployed', true)
         .eq('resolved', false)
-        .gt('deadline', new Date().toISOString()) 
+        .gt('deadline', new Date().toISOString())
         .order('created_at', { ascending: false });
 
       if (!error && dbMarkets && dbMarkets.length > 0) {
@@ -833,7 +833,7 @@ app.get('/api/market/:id', async (req, res) => {
       success: true,
       market: {
         id: market.id.toString(),
-        question: `Will this reach ${market.targetMetric} ${market.metricType}s?`, 
+        question: `Will this reach ${market.targetMetric} ${market.metricType}s?`,
         emoji: '🎯',
         category: market.tweetId.startsWith('ink_') ? 'INK CHAIN' : 'TWITTER',
         tweetId: market.tweetId,
@@ -872,7 +872,7 @@ app.get('/api/user/:address/bets', async (req, res) => {
       bets.push({
         marketId: marketId.toString(),
         tweetId: market.tweetId,
-        amount: ethers.utils.formatUnits(bet.amount, 6), 
+        amount: ethers.utils.formatUnits(bet.amount, 6),
         position: bet.position,
         claimed: bet.claimed,
         resolved: market.resolved,
@@ -1002,7 +1002,7 @@ app.get('/api/user/:address/stats', async (req, res) => {
       .eq('user_address', address)
       .single();
 
-    if (error && error.code !== 'PGRST116') { 
+    if (error && error.code !== 'PGRST116') {
       console.error('Error fetching user stats:', error);
       return res.status(500).json({ success: false, error: error.message });
     }
@@ -1016,7 +1016,10 @@ app.get('/api/user/:address/stats', async (req, res) => {
         total_losses: 0,
         total_volume: 0,
         total_winnings: 0,
-        win_rate: 0
+        win_rate: 0,
+        xp: 0,
+        current_streak: 0,
+        longest_streak: 0
       }
     });
   } catch (error) {
@@ -1088,6 +1091,190 @@ app.post('/api/user/bet', async (req, res) => {
 });
 
 /**
+ * GET /api/user/:address/daily-reward - Check daily reward status
+ */
+app.get('/api/user/:address/daily-reward', async (req, res) => {
+  try {
+    const supabase = require('./supabase-client');
+
+    if (!supabase) {
+      return res.json({
+        success: false,
+        error: 'Database not available'
+      });
+    }
+
+    const address = req.params.address.toLowerCase();
+
+    // Get or create daily reward record
+    let { data: rewardData, error } = await supabase
+      .from('user_daily_rewards')
+      .select('*')
+      .eq('user_address', address)
+      .single();
+
+    // If no record exists, create one
+    if (error && error.code === 'PGRST116') {
+      const { data: newRecord, error: insertError } = await supabase
+        .from('user_daily_rewards')
+        .insert([{
+          user_address: address,
+          current_streak: 0,
+          longest_streak: 0,
+          last_claim_date: null,
+          total_claims: 0,
+          total_xp_earned: 0
+        }])
+        .select()
+        .single();
+
+      if (insertError) {
+        console.error('Error creating daily reward record:', insertError);
+        return res.status(500).json({ success: false, error: insertError.message });
+      }
+
+      rewardData = newRecord;
+    } else if (error) {
+      console.error('Error fetching daily reward:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+
+    // Check if can claim today
+    const now = new Date();
+    const lastClaimDate = rewardData.last_claim_date ? new Date(rewardData.last_claim_date) : null;
+
+    let canClaim = true;
+    let nextClaimTime = null;
+
+    if (lastClaimDate) {
+      const todayDate = now.toISOString().split('T')[0];
+      const lastClaimDateStr = lastClaimDate.toISOString().split('T')[0];
+
+      if (todayDate === lastClaimDateStr) {
+        canClaim = false;
+        // Next claim is tomorrow at midnight
+        const tomorrow = new Date(now);
+        tomorrow.setDate(tomorrow.getDate() + 1);
+        tomorrow.setHours(0, 0, 0, 0);
+        nextClaimTime = tomorrow.toISOString();
+      }
+    }
+
+    res.json({
+      success: true,
+      canClaim,
+      currentStreak: rewardData.current_streak || 0,
+      longestStreak: rewardData.longest_streak || 0,
+      lastClaimed: rewardData.last_claim_date,
+      nextClaimTime,
+      totalClaims: rewardData.total_claims || 0,
+      totalXpEarned: rewardData.total_xp_earned || 0
+    });
+  } catch (error) {
+    console.error('Error checking daily reward:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * POST /api/user/:address/claim-daily - Claim daily reward
+ */
+app.post('/api/user/:address/claim-daily', async (req, res) => {
+  try {
+    const supabase = require('./supabase-client');
+
+    if (!supabase) {
+      return res.json({
+        success: false,
+        error: 'Database not available'
+      });
+    }
+
+    const address = req.params.address.toLowerCase();
+
+    // Use the claim_daily_reward function
+    const dayInWeek = ((req.body.currentStreak || 0) % 7) + 1;
+    const xpRewards = [10, 15, 20, 25, 35, 50, 100];
+    const xpAmount = xpRewards[dayInWeek - 1];
+
+    const { data, error } = await supabase
+      .rpc('claim_daily_reward', {
+        p_user_address: address,
+        p_xp_amount: xpAmount
+      });
+
+    if (error) {
+      console.error('Error claiming daily reward:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+
+    const result = data[0];
+
+    if (!result.success) {
+      return res.status(400).json({
+        success: false,
+        error: result.message
+      });
+    }
+
+    res.json({
+      success: true,
+      reward: {
+        xp: xpAmount,
+        day: dayInWeek,
+        bonus: dayInWeek === 7 ? 'Mystery Badge 🎁' : null
+      },
+      newStreak: result.new_streak,
+      totalXP: result.total_xp,
+      message: result.message
+    });
+  } catch (error) {
+    console.error('Error claiming daily reward:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * GET /api/user/:address/achievements - Get user's unlocked achievements
+ */
+app.get('/api/user/:address/achievements', async (req, res) => {
+  try {
+    const supabase = require('./supabase-client');
+
+    if (!supabase) {
+      return res.json({
+        success: true,
+        achievements: [],
+        message: 'Database not available'
+      });
+    }
+
+    const address = req.params.address.toLowerCase();
+
+    const { data: achievements, error } = await supabase
+      .from('user_achievements')
+      .select('achievement_id, unlocked_at, xp_earned')
+      .eq('user_address', address)
+      .order('unlocked_at', { ascending: false });
+
+    if (error) {
+      console.error('Error fetching achievements:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+
+    res.json({
+      success: true,
+      achievements: achievements.map(a => a.achievement_id),
+      details: achievements
+    });
+  } catch (error) {
+    console.error('Error fetching achievements:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+
+/**
  * POST /api/admin/predictions - Create new prediction (saves to Supabase AND deploys to blockchain)
  */
 app.post('/api/admin/predictions', async (req, res) => {
@@ -1131,7 +1318,7 @@ app.post('/api/admin/predictions', async (req, res) => {
 
     // For Ink Chain predictions, use a placeholder tweet ID and ensure contract address
     if (category === 'INK CHAIN') {
-      tweetId = `ink_${Date.now()}`; 
+      tweetId = `ink_${Date.now()}`;
     }
 
     const predictionData = {
@@ -1447,7 +1634,7 @@ app.get('/api/admin/markets', async (req, res) => {
 
     for (let i = 0; i < marketCount; i++) {
       const market = await contract.markets(i);
-      if (market.resolved) continue; 
+      if (market.resolved) continue;
 
       const metrics = await getTweetMetrics(market.tweetId);
       const [yesOdds, noOdds] = await contract.getOdds(i);
