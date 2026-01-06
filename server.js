@@ -2030,6 +2030,260 @@ app.get('/api/activity/recent', async (req, res) => {
   }
 });
 
+/**
+ * POST /api/markets/propose - Propose a new market (saved to DB for review)
+ */
+app.post('/api/markets/propose', async (req, res) => {
+  try {
+    const supabase = require('./supabase-client');
+
+    if (!supabase) {
+      return res.status(503).json({
+        success: false,
+        error: 'Database service unavailable'
+      });
+    }
+
+    const {
+      creatorAddress,
+      category,
+      question,
+      targetMetric,
+      metricType,
+      durationHours,
+      emoji
+    } = req.body;
+
+    // Validation
+    if (!creatorAddress || !question || !targetMetric || !metricType || !durationHours) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing required fields'
+      });
+    }
+
+    if (category !== 'INK CHAIN') {
+      return res.status(400).json({
+        success: false,
+        error: 'Only Ink Chain markets can be proposed at this time'
+      });
+    }
+
+    // Insert proposal
+    const { data, error } = await supabase
+      .from('market_proposals')
+      .insert([{
+        created_by: creatorAddress.toLowerCase(),
+        category,
+        question,
+        target_metric: targetMetric,
+        metric_type: metricType,
+        duration_hours: durationHours,
+        emoji: emoji || '🎯',
+        status: 'pending'
+      }])
+      .select();
+
+    if (error) {
+      console.error('Error creating proposal:', error);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to save proposal: ' + error.message
+      });
+    }
+
+    console.log(`💡 New market proposal from ${creatorAddress}: ${question}`);
+
+    res.json({
+      success: true,
+      proposal: data[0],
+      message: 'Proposal submitted successfully'
+    });
+
+  } catch (error) {
+    console.error('Error in proposal endpoint:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * GET /api/admin/proposals - Get all pending proposals
+ */
+app.get('/api/admin/proposals', async (req, res) => {
+  try {
+    const supabase = require('./supabase-client');
+
+    if (!supabase) {
+      return res.status(503).json({ success: false, error: 'Database service unavailable' });
+    }
+
+    const { data: proposals, error } = await supabase
+      .from('market_proposals')
+      .select('*')
+      .eq('status', 'pending')
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      console.error('Error fetching proposals:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+
+    res.json({ success: true, proposals: proposals || [] });
+  } catch (error) {
+    console.error('Error in get proposals endpoint:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * POST /api/admin/proposals/approve - Approve a proposal and deploy market
+ */
+app.post('/api/admin/proposals/approve', async (req, res) => {
+  try {
+    const { proposalId } = req.body;
+    const supabase = require('./supabase-client');
+
+    if (!supabase) {
+      return res.status(503).json({ success: false, error: 'Database service unavailable' });
+    }
+
+    // 1. Fetch proposal details
+    const { data: proposal, error: fetchError } = await supabase
+      .from('market_proposals')
+      .select('*')
+      .eq('id', proposalId)
+      .single();
+
+    if (fetchError || !proposal) {
+      return res.status(404).json({ success: false, error: 'Proposal not found' });
+    }
+
+    if (proposal.status !== 'pending') {
+      return res.status(400).json({ success: false, error: `Proposal is already ${proposal.status}` });
+    }
+
+    // 2. Deploy to blockchain
+    // Use placeholder tweet ID for Ink Chain markets if needed
+    const tweetId = proposal.tweet_id || `ink_${Date.now()}`;
+    const deadline = Math.floor(Date.now() / 1000) + (proposal.duration_hours * 3600);
+    const deadlineISO = new Date(deadline * 1000).toISOString();
+
+    console.log(`⛓️ Approving proposal ${proposalId}. Deploying to blockchain...`);
+
+    const tx = await adminContract.createMarket(
+      tweetId,
+      proposal.target_metric,
+      proposal.metric_type,
+      deadline
+    );
+
+    const receipt = await tx.wait();
+
+    // Get market ID
+    let marketId = -1;
+    // Try to get from events, fallback to marketCount
+    if (receipt.events && receipt.events.length > 0) {
+      const marketCreatedEvent = receipt.events.find(e => e.event === 'MarketCreated');
+      if (marketCreatedEvent && marketCreatedEvent.args) {
+        marketId = marketCreatedEvent.args.marketId.toNumber();
+      }
+    }
+
+    if (marketId === -1) {
+      const marketCount = await contract.marketCount();
+      marketId = marketCount.toNumber() - 1;
+    }
+
+    console.log(`✅ Market deployed! ID: ${marketId}, TX: ${receipt.transactionHash}`);
+
+    // 3. Create prediction record in DB (Active Market)
+    const { error: insertError } = await supabase
+      .from('predictions')
+      .insert([{
+        category: proposal.category,
+        question: proposal.question,
+        emoji: proposal.emoji,
+        // Fix for check_data_source constraint: tweet_id must be NULL for INK CHAIN
+        tweet_id: proposal.category === 'INK CHAIN' ? null : tweetId,
+        tweet_url: proposal.tweet_url,
+        ink_contract_address: proposal.category === 'INK CHAIN' ? (proposal.ink_contract_address || null) : null,
+        ink_metric_endpoint: proposal.category === 'INK CHAIN' ? (proposal.ink_metric_endpoint || null) : null,
+        // request_id removed as column may not exist
+        target_metric: proposal.target_metric,
+        metric_type: proposal.metric_type,
+        deadline: deadlineISO,
+        market_id: marketId,
+        deployed: true,
+        resolved: false,
+        created_by: 'admin' // Officially created by admin
+      }]);
+
+    if (insertError) {
+      console.error('Error creating prediction record:', insertError);
+      // Don't fail the request since blockchain deployment succeeded
+    }
+
+    // 4. Update proposal status
+    const { error: updateError } = await supabase
+      .from('market_proposals')
+      .update({
+        status: 'approved',
+        market_id: marketId,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', proposalId);
+
+    res.json({
+      success: true,
+      marketId,
+      transactionHash: receipt.transactionHash,
+      message: 'Proposal approved and market deployed'
+    });
+
+  } catch (error) {
+    console.error('Error approving proposal:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * POST /api/admin/proposals/reject - Reject a proposal
+ */
+app.post('/api/admin/proposals/reject', async (req, res) => {
+  try {
+    const { proposalId, reason } = req.body;
+    const supabase = require('./supabase-client');
+
+    if (!supabase) {
+      return res.status(503).json({ success: false, error: 'Database service unavailable' });
+    }
+
+    const { error } = await supabase
+      .from('market_proposals')
+      .update({
+        status: 'rejected',
+        rejection_reason: reason || 'Rejected by admin',
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', proposalId);
+
+    if (error) {
+      return res.status(500).json({ success: false, error: error.message });
+    }
+
+    console.log(`❌ Proposal ${proposalId} rejected`);
+
+    res.json({
+      success: true,
+      message: 'Proposal rejected'
+    });
+
+  } catch (error) {
+    console.error('Error rejecting proposal:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
 // ============ Health Check ============
 
 app.get('/health', (req, res) => {
