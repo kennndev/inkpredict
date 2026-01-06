@@ -1164,20 +1164,29 @@ app.get('/api/user/:address/stats', async (req, res) => {
       return res.status(500).json({ success: false, error: error.message });
     }
 
+    // Count all bets (including unresolved) from user_bets table
+    const { count: totalBets } = await supabase
+      .from('user_bets')
+      .select('*', { count: 'exact', head: true })
+      .eq('user_address', address);
+
+    // Merge stats with actual bet count
+    const mergedStats = {
+      user_address: address,
+      total_bets: totalBets || 0,  // Use actual count from user_bets
+      total_wins: stats?.total_wins || 0,
+      total_losses: stats?.total_losses || 0,
+      total_volume: stats?.total_volume || 0,
+      total_winnings: stats?.total_winnings || 0,
+      win_rate: stats?.win_rate || 0,
+      xp: stats?.xp || 0,
+      current_streak: stats?.current_streak || 0,
+      longest_streak: stats?.longest_streak || 0
+    };
+
     res.json({
       success: true,
-      stats: stats || {
-        user_address: address,
-        total_bets: 0,
-        total_wins: 0,
-        total_losses: 0,
-        total_volume: 0,
-        total_winnings: 0,
-        win_rate: 0,
-        xp: 0,
-        current_streak: 0,
-        longest_streak: 0
-      }
+      stats: mergedStats
     });
   } catch (error) {
     console.error('Error fetching user stats:', error);
