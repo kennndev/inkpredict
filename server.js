@@ -1358,10 +1358,26 @@ app.post('/api/user/:address/claim-daily', async (req, res) => {
 
     const address = req.params.address.toLowerCase();
 
-    // Use the claim_daily_reward function
-    const dayInWeek = ((req.body.currentStreak || 0) % 7) + 1;
+    // Fetch current streak from database BEFORE calculating XP
+    const { data: rewardData, error: fetchError } = await supabase
+      .from('user_daily_rewards')
+      .select('current_streak')
+      .eq('user_address', address)
+      .single();
+
+    if (fetchError && fetchError.code !== 'PGRST116') {
+      console.error('Error fetching reward data:', fetchError);
+      return res.status(500).json({ success: false, error: fetchError.message });
+    }
+
+    // Calculate day in week based on NEXT claim (current_streak + 1)
+    const currentStreak = rewardData?.current_streak || 0;
+    const nextStreak = currentStreak + 1;
+    const dayInWeek = ((nextStreak - 1) % 7) + 1;
     const xpRewards = [10, 15, 20, 25, 35, 50, 100];
     const xpAmount = xpRewards[dayInWeek - 1];
+
+    console.log(`💰 User ${address} claiming Day ${dayInWeek} reward: ${xpAmount} XP (current streak: ${currentStreak})`);
 
     const { data, error } = await supabase
       .rpc('claim_daily_reward', {
@@ -1857,6 +1873,15 @@ app.post('/api/admin/resolve-market', async (req, res) => {
       return res.status(400).json({
         success: false,
         error: 'Market already resolved'
+      });
+    }
+
+    // Check if market has any bets
+    const totalPool = market.yesPool.add(market.noPool);
+    if (totalPool.isZero()) {
+      return res.status(400).json({
+        success: false,
+        error: 'Cannot resolve market with no bets. Please wait for users to place bets or delete this market.'
       });
     }
 
