@@ -1,0 +1,47 @@
+[
+    {
+        "category": "INK CHAIN",
+        "question": "Will Ink Chain reach 70,000 active wallets?",
+        "emoji": "⛓️",
+        "metricType": "active_wallets",
+        "targetMetric": 70000,
+        "durationHours": 48,
+        "enabled": true
+    },
+    {
+        "category": "INK CHAIN",
+        "question": "Will Ink Chain process 100,000 transactions?",
+        "emoji": "⚡",
+        "metricType": "transactions",
+        "targetMetric": 100000,
+        "durationHours": 24,
+        "enabled": true
+    },
+    {
+        "category": "INK CHAIN",
+        "question": "Will Ink Chain reach block number 500,000?",
+        "emoji": "🔢",
+        "metricType": "block_number",
+        "targetMetric": 500000,
+        "durationHours": 72,
+        "enabled": true
+    },
+    {
+        "category": "INK CHAIN",
+        "question": "Will Ink Chain gas price drop below 5 gwei?",
+        "emoji": "⛽",
+        "metricType": "gas_price",
+        "targetMetric": 5,
+        "durationHours": 24,
+        "enabled": true
+    },
+    {
+        "category": "INK CHAIN",
+        "question": "Will Ink Chain have 50,000 active wallets?",
+        "emoji": "👛",
+        "metricType": "active_wallets",
+        "targetMetric": 50000,
+        "durationHours": 36,
+        "enabled": true
+    }
+]
