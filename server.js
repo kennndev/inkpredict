@@ -772,16 +772,29 @@ app.post('/api/cron-create-prediction', async (req, res) => {
       deadline  // deadline (unix timestamp)
     );
 
-    const receipt = await tx.wait();
-    const marketCreatedEvent = receipt.logs.find(
-      log => log.topics[0] === ethers.utils.id('MarketCreated(uint256,string,uint256,uint256)')
-    );
 
-    if (!marketCreatedEvent) {
+    const receipt = await tx.wait();
+
+    // Parse events using contract interface
+    let marketId;
+    for (const log of receipt.logs) {
+      try {
+        const parsedLog = adminContract.interface.parseLog(log);
+        if (parsedLog.name === 'MarketCreated') {
+          marketId = parsedLog.args[0].toNumber();
+          console.log(`✅ Market created with ID: ${marketId}`);
+          break;
+        }
+      } catch (e) {
+        // Skip logs that aren't from our contract
+        continue;
+      }
+    }
+
+    if (!marketId) {
       throw new Error('MarketCreated event not found in transaction receipt');
     }
 
-    const marketId = parseInt(marketCreatedEvent.topics[1], 16);
     const deadlineDate = new Date(Date.now() + template.durationHours * 3600 * 1000);
 
     // Save to Supabase
