@@ -761,13 +761,15 @@ app.post('/api/cron-create-prediction', async (req, res) => {
 
     // Create the prediction
     const durationSeconds = template.durationHours * 3600;
+    const deadline = Math.floor(Date.now() / 1000) + durationSeconds;
 
+    // Contract expects: createMarket(tweetId, targetMetric, metricType, deadline)
+    // For Ink Chain, use question as tweetId
     const tx = await adminContract.createMarket(
-      template.question,
-      durationSeconds,
-      template.targetMetric,
-      template.category === 'TWITTER' ? template.tweetUrl || '' : '',
-      template.metricType
+      template.question,  // tweetId (use question for Ink Chain)
+      template.targetMetric,  // targetMetric
+      template.metricType,  // metricType
+      deadline  // deadline (unix timestamp)
     );
 
     const receipt = await tx.wait();
@@ -780,7 +782,7 @@ app.post('/api/cron-create-prediction', async (req, res) => {
     }
 
     const marketId = parseInt(marketCreatedEvent.topics[1], 16);
-    const deadline = new Date(Date.now() + template.durationHours * 3600 * 1000);
+    const deadlineDate = new Date(Date.now() + template.durationHours * 3600 * 1000);
 
     // Save to Supabase
     const supabase = require('./supabase-client');
@@ -794,7 +796,7 @@ app.post('/api/cron-create-prediction', async (req, res) => {
         ink_contract_address: template.inkContractAddress || null,
         target_metric: template.targetMetric,
         metric_type: template.metricType,
-        deadline: deadline.toISOString(),
+        deadline: deadlineDate.toISOString(),
         deployed: true,
         resolved: false,
         created_at: new Date().toISOString()
