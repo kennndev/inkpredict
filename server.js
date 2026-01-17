@@ -692,16 +692,55 @@ app.post('/api/cron-create-prediction', async (req, res) => {
 
     console.log('🤖 Auto-creation triggered via cron');
 
-    // Load templates
-    const fs = require('fs');
-    const path = require('path');
-    const templatesPath = path.join(__dirname, 'prediction-templates.json');
+    // Templates embedded directly (Vercel serverless doesn't include all files)
+    const templates = [
+      {
+        category: "INK CHAIN",
+        question: "Will Ink Chain reach 70,000 active wallets?",
+        emoji: "⛓️",
+        metricType: "active_wallets",
+        targetMetric: 70000,
+        durationHours: 48,
+        enabled: true
+      },
+      {
+        category: "INK CHAIN",
+        question: "Will Ink Chain process 100,000 transactions?",
+        emoji: "⚡",
+        metricType: "transactions",
+        targetMetric: 100000,
+        durationHours: 24,
+        enabled: true
+      },
+      {
+        category: "INK CHAIN",
+        question: "Will Ink Chain reach block number 500,000?",
+        emoji: "🔢",
+        metricType: "block_number",
+        targetMetric: 500000,
+        durationHours: 72,
+        enabled: true
+      },
+      {
+        category: "INK CHAIN",
+        question: "Will Ink Chain gas price drop below 5 gwei?",
+        emoji: "⛽",
+        metricType: "gas_price",
+        targetMetric: 5,
+        durationHours: 24,
+        enabled: true
+      },
+      {
+        category: "INK CHAIN",
+        question: "Will Ink Chain have 50,000 active wallets?",
+        emoji: "👛",
+        metricType: "active_wallets",
+        targetMetric: 50000,
+        durationHours: 36,
+        enabled: true
+      }
+    ];
 
-    if (!fs.existsSync(templatesPath)) {
-      throw new Error('Templates file not found');
-    }
-
-    const templates = JSON.parse(fs.readFileSync(templatesPath, 'utf8'));
     const enabledTemplates = templates.filter(t => t.enabled !== false);
 
     if (enabledTemplates.length === 0) {
@@ -711,21 +750,12 @@ app.post('/api/cron-create-prediction', async (req, res) => {
       });
     }
 
-    // Load state to track which template to use next
-    const statePath = path.join(__dirname, '.auto-create-state.json');
-    let state = { lastTemplateIndex: -1, createdCount: 0 };
-
-    if (fs.existsSync(statePath)) {
-      try {
-        state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
-      } catch (e) {
-        console.warn('Could not load state, using defaults');
-      }
-    }
-
-    // Select next template (cycle through all)
-    const nextIndex = (state.lastTemplateIndex + 1) % enabledTemplates.length;
-    const template = enabledTemplates[nextIndex];
+    // Use current day of year to cycle through templates (serverless-friendly)
+    const now = new Date();
+    const startOfYear = new Date(now.getFullYear(), 0, 0);
+    const dayOfYear = Math.floor((now - startOfYear) / (1000 * 60 * 60 * 24));
+    const templateIndex = dayOfYear % enabledTemplates.length;
+    const template = enabledTemplates[templateIndex];
 
     console.log(`📋 Creating prediction from template: "${template.question}"`);
 
@@ -771,20 +801,13 @@ app.post('/api/cron-create-prediction', async (req, res) => {
       }]);
     }
 
-    // Update state
-    state.lastTemplateIndex = nextIndex;
-    state.createdCount++;
-    state.lastCreated = new Date().toISOString();
-    fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
-
-    console.log(`✅ Prediction created! Market ID: ${marketId}, Total created: ${state.createdCount}`);
+    console.log(`✅ Prediction created! Market ID: ${marketId}`);
 
     res.json({
       success: true,
       marketId,
       question: template.question,
-      transactionHash: receipt.hash,
-      totalCreated: state.createdCount
+      transactionHash: receipt.hash
     });
 
   } catch (error) {
