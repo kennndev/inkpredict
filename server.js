@@ -750,79 +750,95 @@ app.post('/api/cron-create-prediction', async (req, res) => {
       });
     }
 
-    // Use current day of year to cycle through templates (serverless-friendly)
-    const now = new Date();
-    const startOfYear = new Date(now.getFullYear(), 0, 0);
-    const dayOfYear = Math.floor((now - startOfYear) / (1000 * 60 * 60 * 24));
-    const templateIndex = dayOfYear % enabledTemplates.length;
-    const template = enabledTemplates[templateIndex];
+    console.log(`📋 Creating ${enabledTemplates.length} predictions from templates...`);
 
-    console.log(`📋 Creating prediction from template: "${template.question}"`);
+    const createdMarkets = [];
+    const errors = [];
 
-    // Create the prediction
-    const durationSeconds = template.durationHours * 3600;
-    const deadline = Math.floor(Date.now() / 1000) + durationSeconds;
-
-    // Contract expects: createMarket(tweetId, targetMetric, metricType, deadline)
-    // For Ink Chain, use question as tweetId
-    const tx = await adminContract.createMarket(
-      template.question,  // tweetId (use question for Ink Chain)
-      template.targetMetric,  // targetMetric
-      template.metricType,  // metricType
-      deadline  // deadline (unix timestamp)
-    );
-
-
-    const receipt = await tx.wait();
-
-    // Parse events using contract interface
-    let marketId;
-    for (const log of receipt.logs) {
+    // Create all enabled templates
+    for (const template of enabledTemplates) {
       try {
-        const parsedLog = adminContract.interface.parseLog(log);
-        if (parsedLog.name === 'MarketCreated') {
-          marketId = parsedLog.args[0].toNumber();
-          console.log(`✅ Market created with ID: ${marketId}`);
-          break;
+        console.log(`� Creating: "${template.question}"`);
+
+        // Create the prediction
+        const durationSeconds = template.durationHours * 3600;
+        const deadline = Math.floor(Date.now() / 1000) + durationSeconds;
+
+        // Contract expects: createMarket(tweetId, targetMetric, metricType, deadline)
+        const tx = await adminContract.createMarket(
+          template.question,
+          template.targetMetric,
+          template.metricType,
+          deadline
+        );
+
+        const receipt = await tx.wait();
+
+        // Parse events using contract interface
+        let marketId;
+        for (const log of receipt.logs) {
+          try {
+            const parsedLog = adminContract.interface.parseLog(log);
+            if (parsedLog.name === 'MarketCreated') {
+              marketId = parsedLog.args[0].toNumber();
+              break;
+            }
+          } catch (e) {
+            continue;
+          }
         }
-      } catch (e) {
-        // Skip logs that aren't from our contract
-        continue;
+
+        if (!marketId) {
+          throw new Error('MarketCreated event not found');
+        }
+
+        const deadlineDate = new Date(Date.now() + template.durationHours * 3600 * 1000);
+
+        // Save to Supabase
+        const supabase = require('./supabase-client');
+        if (supabase) {
+          await supabase.from('predictions').insert([{
+            market_id: marketId,
+            question: template.question,
+            category: template.category,
+            emoji: template.emoji,
+            tweet_url: template.tweetUrl || null,
+            ink_contract_address: template.inkContractAddress || null,
+            target_metric: template.targetMetric,
+            metric_type: template.metricType,
+            deadline: deadlineDate.toISOString(),
+            deployed: true,
+            resolved: false,
+            created_at: new Date().toISOString()
+          }]);
+        }
+
+        console.log(`✅ Created Market ID: ${marketId}`);
+        createdMarkets.push({
+          marketId,
+          question: template.question,
+          transactionHash: receipt.hash
+        });
+
+      } catch (error) {
+        console.error(`❌ Error creating "${template.question}":`, error.message);
+        errors.push({
+          question: template.question,
+          error: error.message
+        });
       }
     }
 
-    if (!marketId) {
-      throw new Error('MarketCreated event not found in transaction receipt');
+    console.log(`\n🎉 Created ${createdMarkets.length} markets successfully!`);
+    if (errors.length > 0) {
+      console.log(`⚠️ ${errors.length} failed`);
     }
-
-    const deadlineDate = new Date(Date.now() + template.durationHours * 3600 * 1000);
-
-    // Save to Supabase
-    const supabase = require('./supabase-client');
-    if (supabase) {
-      await supabase.from('predictions').insert([{
-        market_id: marketId,
-        question: template.question,
-        category: template.category,
-        emoji: template.emoji,
-        tweet_url: template.tweetUrl || null,
-        ink_contract_address: template.inkContractAddress || null,
-        target_metric: template.targetMetric,
-        metric_type: template.metricType,
-        deadline: deadlineDate.toISOString(),
-        deployed: true,
-        resolved: false,
-        created_at: new Date().toISOString()
-      }]);
-    }
-
-    console.log(`✅ Prediction created! Market ID: ${marketId}`);
 
     res.json({
       success: true,
-      marketId,
-      question: template.question,
-      transactionHash: receipt.hash
+      created: createdMarkets.length,
+      markets: createdMarkets,
+      errors: errors.length > 0 ? errors : undefined
     });
 
   } catch (error) {
