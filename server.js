@@ -580,8 +580,18 @@ async function resolveExpiredMarkets() {
   }
 }
 
-// DISABLED: Use GitHub Actions oracle instead to avoid rate limits
-// cron.schedule('* * * * *', resolveExpiredMarkets);
+// Auto-resolution cron job (configurable via environment variables)
+const ENABLE_AUTO_RESOLVE = process.env.ENABLE_AUTO_RESOLVE === 'true';
+const AUTO_RESOLVE_INTERVAL = process.env.AUTO_RESOLVE_INTERVAL_MINUTES || 5;
+
+if (ENABLE_AUTO_RESOLVE) {
+  // Run every X minutes (default: 5 minutes)
+  const cronExpression = `*/${AUTO_RESOLVE_INTERVAL} * * * *`;
+  cron.schedule(cronExpression, resolveExpiredMarkets);
+  console.log(`✅ Auto-resolution enabled: Running every ${AUTO_RESOLVE_INTERVAL} minute(s)`);
+} else {
+  console.log('⏸️  Auto-resolution disabled (set ENABLE_AUTO_RESOLVE=true to enable)');
+}
 
 // ============ API Endpoints ============
 
@@ -1268,6 +1278,66 @@ app.post('/api/user/bet', async (req, res) => {
     });
   } catch (error) {
     console.error('Error recording bet:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * POST /api/user/claim - Mark a bet as claimed after user claims winnings on-chain
+ */
+app.post('/api/user/claim', async (req, res) => {
+  try {
+    const supabase = require('./supabase-client');
+
+    if (!supabase) {
+      return res.status(503).json({
+        success: false,
+        error: 'Database not available'
+      });
+    }
+
+    const { userAddress, marketId, transactionHash } = req.body;
+
+    if (!userAddress || marketId === undefined) {
+      return res.status(400).json({
+        success: false,
+        error: 'userAddress and marketId are required'
+      });
+    }
+
+    console.log(`💰 Claim request: User ${userAddress}, Market #${marketId}, TX: ${transactionHash}`);
+
+    // Update the bet as claimed
+    const { data, error } = await supabase
+      .from('user_bets')
+      .update({ claimed: true })
+      .eq('user_address', userAddress.toLowerCase())
+      .eq('market_id', parseInt(marketId))
+      .eq('won', true)
+      .select();
+
+    if (error) {
+      console.error('Error updating claim status:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+
+    if (!data || data.length === 0) {
+      return res.status(404).json({
+        success: false,
+        error: 'No winning bet found for this user and market'
+      });
+    }
+
+    console.log(`✅ Bet claimed: Market #${marketId}, User ${userAddress}`);
+
+    res.json({
+      success: true,
+      message: 'Claim recorded successfully',
+      bet: data[0]
+    });
+
+  } catch (error) {
+    console.error('Error recording claim:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
