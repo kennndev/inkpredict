@@ -1,0 +1,21 @@
+name: Auto-Resolve Expired Markets
+
+on:
+  schedule:
+    # Run every 5 minutes
+    - cron: '*/5 * * * *'
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  resolve-markets:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Call Auto-Resolve Endpoint
+        run: |
+          curl -X POST "${{ secrets.BACKEND_URL }}/api/oracle/resolve" \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            -H "Content-Type: application/json"
+      
+      - name: Log Result
+        run: echo "Auto-resolution triggered successfully"
