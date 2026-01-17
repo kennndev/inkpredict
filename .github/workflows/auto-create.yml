@@ -1,0 +1,21 @@
+name: Auto-Create Ink Chain Predictions
+
+on:
+  schedule:
+    # Run daily at 9:00 AM UTC
+    - cron: '0 9 * * *'
+  workflow_dispatch: # Allow manual trigger
+
+jobs:
+  create-prediction:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Call Auto-Create Endpoint
+        run: |
+          curl -X POST "${{ secrets.BACKEND_URL }}/api/cron-create-prediction" \
+            -H "Authorization: Bearer ${{ secrets.ADMIN_API_SECRET }}" \
+            -H "Content-Type: application/json"
+      
+      - name: Log Result
+        run: echo "Auto-creation triggered successfully"
