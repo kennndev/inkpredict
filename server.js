@@ -1623,31 +1623,12 @@ app.post('/api/user/:address/claim-daily', async (req, res) => {
 
     const address = req.params.address.toLowerCase();
 
-    // Fetch current streak from database BEFORE calculating XP
-    const { data: rewardData, error: fetchError } = await supabase
-      .from('user_daily_rewards')
-      .select('current_streak')
-      .eq('user_address', address)
-      .single();
+    console.log(`💰 User ${address} claiming daily reward...`);
 
-    if (fetchError && fetchError.code !== 'PGRST116') {
-      console.error('Error fetching reward data:', fetchError);
-      return res.status(500).json({ success: false, error: fetchError.message });
-    }
-
-    // Calculate day in week based on NEXT claim (current_streak + 1)
-    const currentStreak = rewardData?.current_streak || 0;
-    const nextStreak = currentStreak + 1;
-    const dayInWeek = ((nextStreak - 1) % 7) + 1;
-    const xpRewards = [10, 15, 20, 25, 35, 50, 100];
-    const xpAmount = xpRewards[dayInWeek - 1];
-
-    console.log(`💰 User ${address} claiming Day ${dayInWeek} reward: ${xpAmount} XP (current streak: ${currentStreak})`);
-
+    // Call the database function - it handles ALL streak logic and XP calculation
     const { data, error } = await supabase
       .rpc('claim_daily_reward', {
-        p_user_address: address,
-        p_xp_amount: xpAmount
+        p_user_address: address
       });
 
     if (error) {
@@ -1664,10 +1645,16 @@ app.post('/api/user/:address/claim-daily', async (req, res) => {
       });
     }
 
+    // The database function returns the actual XP earned and day number
+    const dayInWeek = result.day_in_week || 1;
+    const xpEarned = result.xp_earned || 10;
+
+    console.log(`✅ User ${address} claimed Day ${dayInWeek} reward: ${xpEarned} XP (new streak: ${result.new_streak})`);
+
     res.json({
       success: true,
       reward: {
-        xp: xpAmount,
+        xp: xpEarned,
         day: dayInWeek,
         bonus: dayInWeek === 7 ? 'Mystery Badge 🎁' : null
       },
