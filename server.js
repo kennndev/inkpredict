@@ -672,6 +672,131 @@ app.get('/api/oracle/resolve', async (req, res) => {
 });
 
 /**
+ * POST /api/cron-create-prediction - Auto-create Ink Chain predictions from templates
+ * Protected by ADMIN_API_SECRET
+ */
+app.post('/api/cron-create-prediction', async (req, res) => {
+  try {
+    // Verify authentication
+    const isVercelCron = req.headers['x-vercel-cron'] === '1';
+    const authHeader = req.headers['authorization'];
+    const providedSecret = authHeader?.replace('Bearer ', '');
+    const expectedSecret = process.env.ADMIN_API_SECRET;
+
+    if (!isVercelCron && (!expectedSecret || providedSecret !== expectedSecret)) {
+      return res.status(401).json({
+        success: false,
+        error: 'Unauthorized - Missing or invalid admin secret'
+      });
+    }
+
+    console.log('🤖 Auto-creation triggered via cron');
+
+    // Load templates
+    const fs = require('fs');
+    const path = require('path');
+    const templatesPath = path.join(__dirname, 'prediction-templates.json');
+
+    if (!fs.existsSync(templatesPath)) {
+      throw new Error('Templates file not found');
+    }
+
+    const templates = JSON.parse(fs.readFileSync(templatesPath, 'utf8'));
+    const enabledTemplates = templates.filter(t => t.enabled !== false);
+
+    if (enabledTemplates.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'No enabled templates found'
+      });
+    }
+
+    // Load state to track which template to use next
+    const statePath = path.join(__dirname, '.auto-create-state.json');
+    let state = { lastTemplateIndex: -1, createdCount: 0 };
+
+    if (fs.existsSync(statePath)) {
+      try {
+        state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
+      } catch (e) {
+        console.warn('Could not load state, using defaults');
+      }
+    }
+
+    // Select next template (cycle through all)
+    const nextIndex = (state.lastTemplateIndex + 1) % enabledTemplates.length;
+    const template = enabledTemplates[nextIndex];
+
+    console.log(`📋 Creating prediction from template: "${template.question}"`);
+
+    // Create the prediction
+    const durationSeconds = template.durationHours * 3600;
+
+    const tx = await adminContract.createMarket(
+      template.question,
+      durationSeconds,
+      template.targetMetric,
+      template.category === 'TWITTER' ? template.tweetUrl || '' : '',
+      template.metricType
+    );
+
+    const receipt = await tx.wait();
+    const marketCreatedEvent = receipt.logs.find(
+      log => log.topics[0] === ethers.id('MarketCreated(uint256,string,uint256,uint256)')
+    );
+
+    if (!marketCreatedEvent) {
+      throw new Error('MarketCreated event not found in transaction receipt');
+    }
+
+    const marketId = parseInt(marketCreatedEvent.topics[1], 16);
+    const deadline = new Date(Date.now() + template.durationHours * 3600 * 1000);
+
+    // Save to Supabase
+    const supabase = require('./supabase-client');
+    if (supabase) {
+      await supabase.from('predictions').insert([{
+        market_id: marketId,
+        question: template.question,
+        category: template.category,
+        emoji: template.emoji,
+        tweet_url: template.tweetUrl || null,
+        ink_contract_address: template.inkContractAddress || null,
+        target_metric: template.targetMetric,
+        metric_type: template.metricType,
+        deadline: deadline.toISOString(),
+        deployed: true,
+        resolved: false,
+        created_at: new Date().toISOString()
+      }]);
+    }
+
+    // Update state
+    state.lastTemplateIndex = nextIndex;
+    state.createdCount++;
+    state.lastCreated = new Date().toISOString();
+    fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+
+    console.log(`✅ Prediction created! Market ID: ${marketId}, Total created: ${state.createdCount}`);
+
+    res.json({
+      success: true,
+      marketId,
+      question: template.question,
+      transactionHash: receipt.hash,
+      totalCreated: state.createdCount
+    });
+
+  } catch (error) {
+    console.error('❌ Error in auto-creation:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
  * GET /api/markets - Get all active markets (merged from Supabase + Blockchain)
  */
 app.get('/api/markets', async (req, res) => {
