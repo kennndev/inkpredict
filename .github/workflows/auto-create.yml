@@ -2,8 +2,8 @@ name: Auto-Create Ink Chain Predictions
 
 on:
   schedule:
-    # Run daily at 5:30 PM PKT (12:30 UTC)
-    - cron: '30 12 * * *'
+    # Run daily at 5:55 PM PKT (12:55 UTC) - TESTING
+    - cron: '55 12 * * *'
   workflow_dispatch: # Allow manual trigger
 
 jobs:
