@@ -774,7 +774,7 @@ app.post('/api/cron-create-prediction', async (req, res) => {
 
     const receipt = await tx.wait();
     const marketCreatedEvent = receipt.logs.find(
-      log => log.topics[0] === ethers.id('MarketCreated(uint256,string,uint256,uint256)')
+      log => log.topics[0] === ethers.utils.id('MarketCreated(uint256,string,uint256,uint256)')
     );
 
     if (!marketCreatedEvent) {
