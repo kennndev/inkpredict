@@ -1,6 +1,7 @@
 const express = require('express');
 const { TwitterApi } = require('twitter-api-v2');
 const { ethers } = require('ethers');
+const crypto = require('crypto');
 const cron = require('node-cron');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
@@ -1285,6 +1286,313 @@ app.get('/api/leaderboard', async (req, res) => {
     });
   } catch (error) {
     console.error('Error fetching leaderboard:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+
+/**
+ * Referral helpers
+ */
+const REFERRAL_MESSAGE_PREFIX = 'Boink Referral: Create code for';
+const REFERRER_XP_BONUS = 10;
+const REFEREE_XP_BONUS = 5;
+
+const normalizeAddress = (address) => address?.toLowerCase();
+
+const generateReferralCode = () => {
+  return crypto.randomBytes(4).toString('hex').toUpperCase();
+};
+
+const verifyReferralSignature = (address, signature) => {
+  const message = `${REFERRAL_MESSAGE_PREFIX} ${address}`;
+  const recovered = ethers.utils.verifyMessage(message, signature);
+  return recovered?.toLowerCase() == address?.toLowerCase();
+};
+
+const incrementUserXp = async (supabase, address, delta) => {
+  const normalized = normalizeAddress(address);
+  if (!normalized) return;
+
+  const { data: existing, error: fetchError } = await supabase
+    .from('user_stats')
+    .select('xp')
+    .eq('user_address', normalized)
+    .single();
+
+  if (fetchError && fetchError.code != 'PGRST116') {
+    throw fetchError;
+  }
+
+  const currentXp = existing?.xp || 0;
+  const nextXp = currentXp + delta;
+
+  const { error: upsertError } = await supabase
+    .from('user_stats')
+    .upsert({
+      user_address: normalized,
+      xp: nextXp,
+      updated_at: new Date().toISOString()
+    }, { onConflict: 'user_address' });
+
+  if (upsertError) {
+    throw upsertError;
+  }
+};
+
+/**
+ * GET /api/referrals/status/:address - Check if user already redeemed a referral
+ */
+app.get('/api/referrals/status/:address', async (req, res) => {
+  try {
+    const supabase = require('./supabase-client');
+
+    if (!supabase) {
+      return res.json({
+        success: true,
+        redeemed: false,
+        message: 'Database not available'
+      });
+    }
+
+    const address = normalizeAddress(req.params.address);
+
+    const { data, error } = await supabase
+      .from('referral_uses')
+      .select('referrer_address')
+      .eq('referee_address', address)
+      .single();
+
+    if (error && error.code != 'PGRST116') {
+      console.error('Error checking referral status:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+
+    res.json({
+      success: true,
+      redeemed: !!data,
+      referrerAddress: data?.referrer_address || null
+    });
+  } catch (error) {
+    console.error('Error checking referral status:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * GET /api/referrals/:address - Get referral code and stats for a user
+ */
+app.get('/api/referrals/:address', async (req, res) => {
+  try {
+    const supabase = require('./supabase-client');
+
+    if (!supabase) {
+      return res.json({
+        success: true,
+        code: null,
+        totalReferrals: 0,
+        totalXpEarned: 0,
+        message: 'Database not available'
+      });
+    }
+
+    const address = normalizeAddress(req.params.address);
+
+    const { data, error } = await supabase
+      .from('referral_codes')
+      .select('code, total_referrals, total_xp_earned')
+      .eq('referrer_address', address)
+      .single();
+
+    if (error && error.code != 'PGRST116') {
+      console.error('Error fetching referral code:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+
+    res.json({
+      success: true,
+      code: data?.code || null,
+      totalReferrals: data?.total_referrals || 0,
+      totalXpEarned: data?.total_xp_earned || 0
+    });
+  } catch (error) {
+    console.error('Error fetching referral code:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * POST /api/referrals/create - Create (or fetch) referral code for user
+ */
+app.post('/api/referrals/create', async (req, res) => {
+  try {
+    const supabase = require('./supabase-client');
+
+    if (!supabase) {
+      return res.json({
+        success: false,
+        error: 'Database not available'
+      });
+    }
+
+    const { userAddress, signature } = req.body;
+    const address = normalizeAddress(userAddress);
+
+    if (!address || !signature) {
+      return res.status(400).json({ success: false, error: 'userAddress and signature are required' });
+    }
+
+    if (!verifyReferralSignature(address, signature)) {
+      return res.status(400).json({ success: false, error: 'Invalid signature' });
+    }
+
+    const { data: existing, error: fetchError } = await supabase
+      .from('referral_codes')
+      .select('code, total_referrals, total_xp_earned')
+      .eq('referrer_address', address)
+      .single();
+
+    if (fetchError && fetchError.code != 'PGRST116') {
+      console.error('Error fetching referral code:', fetchError);
+      return res.status(500).json({ success: false, error: fetchError.message });
+    }
+
+    if (existing?.code) {
+      return res.json({
+        success: true,
+        code: existing.code,
+        totalReferrals: existing.total_referrals || 0,
+        totalXpEarned: existing.total_xp_earned || 0
+      });
+    }
+
+    const code = generateReferralCode();
+
+    const { data: created, error: insertError } = await supabase
+      .from('referral_codes')
+      .insert([{ 
+        referrer_address: address,
+        code,
+        signature,
+        total_referrals: 0,
+        total_xp_earned: 0,
+        updated_at: new Date().toISOString()
+      }])
+      .select()
+      .single();
+
+    if (insertError) {
+      console.error('Error creating referral code:', insertError);
+      return res.status(500).json({ success: false, error: insertError.message });
+    }
+
+    res.json({
+      success: true,
+      code: created.code,
+      totalReferrals: created.total_referrals || 0,
+      totalXpEarned: created.total_xp_earned || 0
+    });
+  } catch (error) {
+    console.error('Error creating referral code:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * POST /api/referrals/redeem - Redeem a referral code
+ */
+app.post('/api/referrals/redeem', async (req, res) => {
+  try {
+    const supabase = require('./supabase-client');
+
+    if (!supabase) {
+      return res.json({
+        success: false,
+        error: 'Database not available'
+      });
+    }
+
+    const { refereeAddress, code } = req.body;
+    const referee = normalizeAddress(refereeAddress);
+    const normalizedCode = code?.trim()?.toUpperCase();
+
+    if (!referee || !normalizedCode) {
+      return res.status(400).json({ success: false, error: 'refereeAddress and code are required' });
+    }
+
+    const { data: referrerRow, error: referrerError } = await supabase
+      .from('referral_codes')
+      .select('referrer_address, total_referrals, total_xp_earned')
+      .eq('code', normalizedCode)
+      .single();
+
+    if (referrerError) {
+      console.error('Error fetching referral code:', referrerError);
+      return res.status(400).json({ success: false, error: 'Invalid referral code' });
+    }
+
+    if (referrerRow.referrer_address == referee) {
+      return res.status(400).json({ success: false, error: 'You cannot use your own referral code' });
+    }
+
+    const { data: existingUse, error: useError } = await supabase
+      .from('referral_uses')
+      .select('id')
+      .eq('referee_address', referee)
+      .single();
+
+    if (useError && useError.code != 'PGRST116') {
+      console.error('Error checking referral usage:', useError);
+      return res.status(500).json({ success: false, error: useError.message });
+    }
+
+    if (existingUse) {
+      return res.status(400).json({ success: false, error: 'Referral already used by this wallet' });
+    }
+
+    const { error: insertUseError } = await supabase
+      .from('referral_uses')
+      .insert([{ 
+        referrer_address: referrerRow.referrer_address,
+        referee_address: referee,
+        code: normalizedCode,
+        xp_referrer: REFERRER_XP_BONUS,
+        xp_referee: REFEREE_XP_BONUS
+      }]);
+
+    if (insertUseError) {
+      console.error('Error storing referral use:', insertUseError);
+      return res.status(500).json({ success: false, error: insertUseError.message });
+    }
+
+    const totalReferrals = (referrerRow.total_referrals || 0) + 1;
+    const totalXpEarned = (referrerRow.total_xp_earned || 0) + REFERRER_XP_BONUS;
+
+    const { error: updateCodeError } = await supabase
+      .from('referral_codes')
+      .update({
+        total_referrals: totalReferrals,
+        total_xp_earned: totalXpEarned,
+        updated_at: new Date().toISOString()
+      })
+      .eq('referrer_address', referrerRow.referrer_address);
+
+    if (updateCodeError) {
+      console.error('Error updating referral totals:', updateCodeError);
+      return res.status(500).json({ success: false, error: updateCodeError.message });
+    }
+
+    await incrementUserXp(supabase, referrerRow.referrer_address, REFERRER_XP_BONUS);
+    await incrementUserXp(supabase, referee, REFEREE_XP_BONUS);
+
+    res.json({
+      success: true,
+      referrerAddress: referrerRow.referrer_address,
+      referrerXp: REFERRER_XP_BONUS,
+      refereeXp: REFEREE_XP_BONUS
+    });
+  } catch (error) {
+    console.error('Error redeeming referral code:', error);
     res.status(500).json({ success: false, error: error.message });
   }
 });
