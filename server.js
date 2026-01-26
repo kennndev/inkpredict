@@ -162,74 +162,355 @@ async function getTweetMetrics(tweetId) {
 }
 
 /**
- * Get Ink Chain metrics via RPC
+ * Helper function to find block number at a specific timestamp
+ * Uses binary search for efficiency with caching and error handling
  */
-async function getInkChainMetrics(metricType, contractAddress = null) {
+const blockTimestampCache = new Map(); // Cache block timestamps to avoid repeated queries
+
+async function getBlockAtTimestamp(targetTimestamp, maxIterations = 50) {
+  try {
+    const latestBlock = await provider.getBlock('latest');
+    
+    // If target is in the future or very recent, return latest
+    if (targetTimestamp >= latestBlock.timestamp) {
+      return latestBlock.number;
+    }
+    
+    // If target is before genesis, return 0
+    if (targetTimestamp <= 0) {
+      return 0;
+    }
+    
+    // Binary search for the block with caching
+    let low = 0;
+    let high = latestBlock.number;
+    let bestBlock = 0;
+    let iterations = 0;
+    
+    while (low <= high && iterations < maxIterations) {
+      iterations++;
+      const mid = Math.floor((low + high) / 2);
+      
+      // Check cache first
+      let block;
+      if (blockTimestampCache.has(mid)) {
+        block = blockTimestampCache.get(mid);
+      } else {
+        try {
+          block = await provider.getBlock(mid);
+          // Cache recent blocks (within last 1000 blocks)
+          if (mid > latestBlock.number - 1000) {
+            blockTimestampCache.set(mid, block);
+            // Limit cache size (remove oldest entries)
+            if (blockTimestampCache.size > 100) {
+              const keys = Array.from(blockTimestampCache.keys());
+              // Remove the oldest (lowest block number)
+              const oldestKey = Math.min(...keys);
+              blockTimestampCache.delete(oldestKey);
+            }
+          }
+        } catch (error) {
+          console.warn(`Error fetching block ${mid}:`, error.message);
+          // If block doesn't exist, adjust search
+          if (error.message.includes('not found') || error.code === -32000) {
+            high = mid - 1;
+            continue;
+          }
+          throw error;
+        }
+      }
+      
+      if (block && block.timestamp <= targetTimestamp) {
+        bestBlock = mid;
+        low = mid + 1;
+      } else {
+        high = mid - 1;
+      }
+    }
+    
+    if (iterations >= maxIterations) {
+      console.warn(`⚠️ Binary search hit max iterations, using best block ${bestBlock}`);
+    }
+    
+    return bestBlock;
+  } catch (error) {
+    console.error('Error finding block at timestamp:', error);
+    // Fallback: estimate based on average block time
+    try {
+      const latestBlock = await provider.getBlock('latest');
+      const avgBlockTime = 2; // seconds (approximate for Ink Chain)
+      const timeDiff = latestBlock.timestamp - targetTimestamp;
+      const blocksAgo = Math.floor(timeDiff / avgBlockTime);
+      const estimatedBlock = Math.max(0, latestBlock.number - blocksAgo);
+      console.log(`📊 Using estimated block ${estimatedBlock} (fallback)`);
+      return estimatedBlock;
+    } catch (fallbackError) {
+      console.error('Fallback also failed:', fallbackError);
+      // Last resort: return a safe default
+      return 0;
+    }
+  }
+}
+
+/**
+ * Get Ink Chain metrics via RPC
+ * @param {string} metricType - Type of metric to fetch
+ * @param {string|null} contractAddress - Optional contract address
+ * @param {object|null} marketInfo - Optional market info with createdAt and deadline timestamps
+ */
+async function getInkChainMetrics(metricType, contractAddress = null, marketInfo = null) {
   try {
     console.log(`⛓️ Fetching Ink Chain metric: ${metricType}`);
 
     switch (metricType) {
       case 'transactions': {
-        // Get total transaction count from latest block
+        // Count transactions during market period or at deadline
+        try {
+          let targetBlock;
+          
+          if (marketInfo && marketInfo.deadline) {
+            // Use block at market deadline for deterministic result
+            const deadlineTimestamp = typeof marketInfo.deadline === 'number'
+              ? marketInfo.deadline
+              : marketInfo.deadline.toNumber();
+            targetBlock = await getBlockAtTimestamp(deadlineTimestamp);
+            console.log(`📅 Using block ${targetBlock} at market deadline`);
+          } else {
+            // Fallback: use latest block
         const latestBlock = await provider.getBlock('latest');
-        const blockNumber = latestBlock.number;
+            targetBlock = latestBlock.number;
+            console.log(`⚠️ No market info, using latest block ${targetBlock}`);
+          }
 
-        // If contract address provided, get contract-specific tx count
+          // If contract address provided, get contract-specific tx count at target block
         if (contractAddress) {
-          const txCount = await provider.getTransactionCount(contractAddress);
-          return { value: txCount, blockNumber };
-        }
+            const txCount = await provider.getTransactionCount(contractAddress, targetBlock);
+            return { value: txCount, blockNumber: targetBlock };
+          }
 
-        // Otherwise return total network transactions (approximation)
-        return { value: blockNumber * 10, blockNumber };
+          // For network-wide transactions, count transactions in blocks during market period
+          if (marketInfo && marketInfo.createdAt && marketInfo.deadline) {
+            const createdAtTimestamp = typeof marketInfo.createdAt === 'number' 
+              ? marketInfo.createdAt 
+              : marketInfo.createdAt.toNumber();
+            const deadlineTimestamp = typeof marketInfo.deadline === 'number'
+              ? marketInfo.deadline
+              : marketInfo.deadline.toNumber();
+            
+            const startBlock = await getBlockAtTimestamp(createdAtTimestamp);
+            const endBlock = await getBlockAtTimestamp(deadlineTimestamp);
+            
+            // Count transactions in market period (sample approach for efficiency)
+            // For very large ranges, sample blocks or use approximation
+            const blockRange = endBlock - startBlock;
+            let txCount = 0;
+            
+            if (blockRange <= 1000) {
+              // Small range: count all blocks
+              console.log(`📊 Counting transactions in ${blockRange} blocks (${startBlock} to ${endBlock})...`);
+              const sampleSize = Math.min(100, blockRange); // Sample up to 100 blocks
+              const step = Math.max(1, Math.floor(blockRange / sampleSize));
+              
+              for (let i = startBlock; i <= endBlock; i += step) {
+                try {
+                  const block = await provider.getBlock(i);
+                  txCount += block.transactions.length;
+                  if ((i - startBlock) % (step * 10) === 0) {
+                    await new Promise(resolve => setTimeout(resolve, 50)); // Rate limit
+                  }
+                } catch (err) {
+                  console.warn(`Error fetching block ${i}:`, err.message);
+                }
+              }
+              
+              // Extrapolate if sampled
+              if (sampleSize < blockRange) {
+                txCount = Math.floor(txCount * (blockRange / sampleSize));
+              }
+            } else {
+              // Large range: use approximation
+              console.log(`📊 Large range (${blockRange} blocks), using approximation...`);
+              txCount = blockRange * 10; // Rough estimate: ~10 txs per block
+            }
+            
+            return { value: txCount, blockRange: `${startBlock}-${endBlock}`, blockNumber: endBlock };
+          }
+
+          // Fallback: approximation based on block number
+          return { value: targetBlock * 10, blockNumber: targetBlock };
+        } catch (error) {
+          console.error('Error counting transactions:', error);
+          // Fallback
+          const latestBlock = await provider.getBlock('latest');
+          return { value: latestBlock.number * 10, blockNumber: latestBlock.number, note: 'Fallback estimate' };
+        }
       }
 
       case 'block_number': {
+        // Use block number at market deadline for deterministic result
+        try {
+          let targetBlock;
+          
+          if (marketInfo && marketInfo.deadline) {
+            const deadlineTimestamp = typeof marketInfo.deadline === 'number'
+              ? marketInfo.deadline
+              : marketInfo.deadline.toNumber();
+            targetBlock = await getBlockAtTimestamp(deadlineTimestamp);
+            const block = await provider.getBlock(targetBlock);
+            console.log(`📅 Using block ${targetBlock} at market deadline`);
+            return { value: targetBlock, timestamp: block.timestamp };
+          } else {
+            // Fallback: use latest block
         const latestBlock = await provider.getBlock('latest');
         return { value: latestBlock.number, timestamp: latestBlock.timestamp };
+          }
+        } catch (error) {
+          console.error('Error getting block number:', error);
+          const latestBlock = await provider.getBlock('latest');
+          return { value: latestBlock.number, timestamp: latestBlock.timestamp };
+        }
       }
 
       case 'tvl': {
-        // Get ETH balance of a contract (if provided)
+        // Get TVL at market deadline for deterministic result
+        try {
+          let targetBlock;
+          
+          if (marketInfo && marketInfo.deadline) {
+            const deadlineTimestamp = typeof marketInfo.deadline === 'number'
+              ? marketInfo.deadline
+              : marketInfo.deadline.toNumber();
+            targetBlock = await getBlockAtTimestamp(deadlineTimestamp);
+            console.log(`📅 Using block ${targetBlock} at market deadline for TVL`);
+          } else {
+            const latestBlock = await provider.getBlock('latest');
+            targetBlock = latestBlock.number;
+          }
+
+          // Get ETH balance of a contract (if provided) at target block
         if (contractAddress) {
-          const balance = await provider.getBalance(contractAddress);
+            // Note: getBalance doesn't support block number directly in ethers v5
+            // We'll use the balance at the target block by querying at that block
+            const balance = await provider.getBalance(contractAddress, targetBlock);
           const ethBalance = parseFloat(ethers.utils.formatEther(balance));
-          return { value: Math.floor(ethBalance * 1000), unit: 'ETH' };
+            return { value: Math.floor(ethBalance * 1000), unit: 'ETH', blockNumber: targetBlock };
+          }
+          return { value: 0, unit: 'ETH', blockNumber: targetBlock };
+        } catch (error) {
+          console.error('Error getting TVL:', error);
+          return { value: 0, unit: 'ETH', note: 'Error' };
         }
-        return { value: 0, unit: 'ETH' };
       }
 
       case 'gas_price': {
+        // Get gas price at market deadline for deterministic result
+        try {
+          let targetBlock;
+          
+          if (marketInfo && marketInfo.deadline) {
+            const deadlineTimestamp = typeof marketInfo.deadline === 'number'
+              ? marketInfo.deadline
+              : marketInfo.deadline.toNumber();
+            targetBlock = await getBlockAtTimestamp(deadlineTimestamp);
+            console.log(`📅 Using block ${targetBlock} at market deadline for gas price`);
+          } else {
+            const latestBlock = await provider.getBlock('latest');
+            targetBlock = latestBlock.number;
+          }
+
+          // Get gas price at target block
+          const block = await provider.getBlock(targetBlock);
+          const gasPrice = block.gasPrice || await provider.getGasPrice();
+          const gwei = parseFloat(ethers.utils.formatUnits(gasPrice, 'gwei'));
+          // Ensure we return at least 1 if gas price is very low (not 0)
+          const value = Math.max(1, Math.floor(gwei));
+          console.log(`Gas price at block ${targetBlock}: ${gwei} gwei → ${value} (rounded)`);
+          return { value, unit: 'gwei', blockNumber: targetBlock };
+        } catch (error) {
+          console.error('Error getting gas price:', error);
+          // Fallback
         const gasPrice = await provider.getGasPrice();
         const gwei = parseFloat(ethers.utils.formatUnits(gasPrice, 'gwei'));
-        // Ensure we return at least 1 if gas price is very low (not 0)
-        const value = Math.max(1, Math.floor(gwei));
-        console.log(`Gas price: ${gwei} gwei → ${value} (rounded)`);
-        return { value, unit: 'gwei' };
+          return { value: Math.max(1, Math.floor(gwei)), unit: 'gwei', note: 'Fallback' };
+        }
       }
 
       case 'active_wallets': {
-        // Count unique addresses that have sent transactions in recent blocks
-        // This is an approximation - we check the last 100 blocks for unique "from" addresses
+        // Count unique addresses that sent transactions during the market's active period
+        // Use market's createdAt to deadline block range for deterministic, verifiable results
         try {
+          let startBlock, endBlock;
+          
+          if (marketInfo && marketInfo.createdAt && marketInfo.deadline) {
+            // Use market's specific time range for deterministic results
+            const createdAtTimestamp = typeof marketInfo.createdAt === 'number' 
+              ? marketInfo.createdAt 
+              : marketInfo.createdAt.toNumber();
+            const deadlineTimestamp = typeof marketInfo.deadline === 'number'
+              ? marketInfo.deadline
+              : marketInfo.deadline.toNumber();
+            
+            console.log(`📅 Market period: ${new Date(createdAtTimestamp * 1000).toISOString()} to ${new Date(deadlineTimestamp * 1000).toISOString()}`);
+            
+            // Find block numbers at these timestamps
+            startBlock = await getBlockAtTimestamp(createdAtTimestamp);
+            endBlock = await getBlockAtTimestamp(deadlineTimestamp);
+            
+            // Ensure we have a valid range
+            if (endBlock < startBlock) {
+              console.warn(`⚠️ End block (${endBlock}) < start block (${startBlock}), using latest block`);
           const latestBlock = await provider.getBlock('latest');
-          const blockNumber = latestBlock.number;
+              endBlock = latestBlock.number;
+            }
+            
+            console.log(`🔍 Checking blocks ${startBlock} to ${endBlock} (market period)`);
+          } else {
+            // Fallback: use last 100 blocks if market info not provided
+            const latestBlock = await provider.getBlock('latest');
+            endBlock = latestBlock.number;
+            startBlock = Math.max(0, endBlock - 100);
+            console.log(`⚠️ No market info provided, using last 100 blocks (${startBlock} to ${endBlock})`);
+          }
+          
           const uniqueAddresses = new Set();
+          const blocksToCheck = endBlock - startBlock + 1;
+          
+          console.log(`🔍 Checking ${blocksToCheck} blocks (${startBlock} to ${endBlock}) for active wallets...`);
+          console.log(`⏱️  This may take several minutes for large ranges...`);
 
-          // Check last 100 blocks (or fewer if chain is shorter)
-          const startBlock = Math.max(0, blockNumber - 100);
-          const blocksToCheck = Math.min(100, blockNumber + 1);
+          // Adaptive batch size based on range size
+          let batchSize = 10;
+          if (blocksToCheck > 1000) {
+            batchSize = 20; // Larger batches for efficiency
+          } else if (blocksToCheck > 5000) {
+            batchSize = 50; // Even larger for very large ranges
+          }
 
-          console.log(`Checking ${blocksToCheck} blocks (${startBlock} to ${blockNumber}) for active wallets...`);
+          let processedBlocks = 0;
+          const totalBatches = Math.ceil(blocksToCheck / batchSize);
+          
+          for (let i = startBlock; i <= endBlock; i += batchSize) {
+            const batchEnd = Math.min(i + batchSize - 1, endBlock);
+            const batchNum = Math.floor((i - startBlock) / batchSize) + 1;
+            
+            // Progress logging
+            if (batchNum % 10 === 0 || batchNum === 1 || batchNum === totalBatches) {
+              console.log(`📊 Processing batch ${batchNum}/${totalBatches} (blocks ${i}-${batchEnd})...`);
+            }
 
-          // Process blocks in batches to avoid overwhelming the RPC
-          const batchSize = 10;
-          for (let i = startBlock; i <= blockNumber; i += batchSize) {
-            const endBlock = Math.min(i + batchSize - 1, blockNumber);
-            const promises = [];
-
-            for (let blockNum = i; blockNum <= endBlock; blockNum++) {
-              promises.push(provider.getBlockWithTransactions(blockNum));
+            let retries = 3;
+            let success = false;
+            
+            while (retries > 0 && !success) {
+              try {
+                const promises = [];
+                for (let blockNum = i; blockNum <= batchEnd; blockNum++) {
+                  promises.push(
+                    provider.getBlockWithTransactions(blockNum).catch(err => {
+                      console.warn(`⚠️ Error fetching block ${blockNum}:`, err.message);
+                      return null; // Return null on error, we'll skip it
+                    })
+                  );
             }
 
             const blocks = await Promise.all(promises);
@@ -237,22 +518,46 @@ async function getInkChainMetrics(metricType, contractAddress = null) {
             for (const block of blocks) {
               if (block && block.transactions) {
                 for (const tx of block.transactions) {
-                  if (tx.from) {
+                      if (tx && tx.from) {
                     uniqueAddresses.add(tx.from.toLowerCase());
                   }
                 }
               }
             }
 
-            // Small delay to avoid rate limiting
-            if (i + batchSize <= blockNumber) {
-              await new Promise(resolve => setTimeout(resolve, 100));
+                processedBlocks += blocks.filter(b => b !== null).length;
+                success = true;
+              } catch (error) {
+                retries--;
+                if (retries > 0) {
+                  console.warn(`⚠️ Batch ${batchNum} failed, retrying... (${retries} attempts left)`);
+                  await new Promise(resolve => setTimeout(resolve, 1000 * (4 - retries))); // Exponential backoff
+                } else {
+                  console.error(`❌ Batch ${batchNum} failed after 3 attempts:`, error.message);
+                  // Continue with next batch instead of failing completely
+                }
+              }
+            }
+
+            // Rate limiting delay (longer for large ranges)
+            if (i + batchSize <= endBlock) {
+              const delay = blocksToCheck > 1000 ? 200 : 100;
+              await new Promise(resolve => setTimeout(resolve, delay));
             }
           }
 
+          console.log(`✅ Processed ${processedBlocks} blocks, found ${uniqueAddresses.size} unique wallets`);
+
           const count = uniqueAddresses.size;
-          console.log(`Found ${count} unique active wallet addresses in recent blocks`);
-          return { value: count, blockRange: `${startBlock}-${blockNumber}` };
+          console.log(`Found ${count} unique active wallet addresses in blocks ${startBlock}-${endBlock}`);
+          return { 
+            value: count, 
+            blockRange: `${startBlock}-${endBlock}`,
+            marketPeriod: marketInfo ? {
+              createdAt: marketInfo.createdAt,
+              deadline: marketInfo.deadline
+            } : null
+          };
         } catch (error) {
           console.error(`Error counting active wallets:`, error.message);
           // Fallback: return a rough estimate based on block number
@@ -282,8 +587,8 @@ async function getInkChainMetrics(metricType, contractAddress = null) {
         const mappedMetric = metricAliases[metricType.toLowerCase()];
         if (mappedMetric) {
           console.log(`⚠️ Mapping "${metricType}" to "${mappedMetric}" for Ink Chain prediction`);
-          // Recursively call with mapped metric
-          return await getInkChainMetrics(mappedMetric, contractAddress);
+          // Recursively call with mapped metric (preserve marketInfo)
+          return await getInkChainMetrics(mappedMetric, contractAddress, marketInfo);
         }
         
         console.error(`Unknown metric type: ${metricType}. Supported Ink Chain metrics: transactions, block_number, tvl, gas_price, active_wallets`);
@@ -568,7 +873,12 @@ async function resolveExpiredMarkets() {
         // Handle Ink Chain predictions
         if (isInkChainMarket) {
           console.log('⛓️ Fetching Ink Chain metrics...');
-          const inkMetrics = await getInkChainMetrics(metricType, market.inkContractAddress || null);
+          // Pass market info for time-based metrics (like active_wallets)
+          const marketInfo = {
+            createdAt: market.createdAt,
+            deadline: market.deadline
+          };
+          const inkMetrics = await getInkChainMetrics(metricType, market.inkContractAddress || null, marketInfo);
           if (inkMetrics && inkMetrics.value !== undefined) {
             actualMetric = typeof inkMetrics.value === 'number' ? inkMetrics.value : parseInt(inkMetrics.value);
           } else {
@@ -1853,13 +2163,13 @@ app.post('/api/user/bet', async (req, res) => {
       .eq('market_id', marketId)
       .single();
 
-      // Insert bet record
-      const { data: bet, error: betError } = await supabase
-        .from('user_bets')
-        .insert([{
-          user_address: userAddress.toLowerCase(),
-          market_id: marketId,
-          prediction_id: prediction?.id || null,
+    // Insert bet record
+    const { data: bet, error: betError } = await supabase
+      .from('user_bets')
+      .insert([{
+        user_address: userAddress.toLowerCase(),
+        market_id: marketId,
+        prediction_id: prediction?.id || null,
         amount: parseFloat(amount),
         position: position,
         claimed: false,
@@ -1867,10 +2177,10 @@ app.post('/api/user/bet', async (req, res) => {
       }])
       .select();
 
-      if (betError) {
-        console.error('Error recording bet:', betError);
-        return res.status(500).json({ success: false, error: betError.message });
-      }
+    if (betError) {
+      console.error('Error recording bet:', betError);
+      return res.status(500).json({ success: false, error: betError.message });
+    }
 
       // Check and award achievements based on updated stats
       let achievementUnlocked = null;
@@ -1923,14 +2233,14 @@ app.post('/api/user/bet', async (req, res) => {
         console.error('Error checking achievements:', achievementFlowError);
       }
 
-      console.log(`✅ Bet recorded: User ${userAddress}, Market ${marketId}, Amount ${amount} USDC, Position ${position ? 'YES' : 'NO'}`);
+    console.log(`✅ Bet recorded: User ${userAddress}, Market ${marketId}, Amount ${amount} USDC, Position ${position ? 'YES' : 'NO'}`);
 
-      res.json({
-        success: true,
+    res.json({
+      success: true,
         bet: bet[0],
         achievementUnlocked,
         xpAwarded
-      });
+    });
   } catch (error) {
     console.error('Error recording bet:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -1953,21 +2263,37 @@ app.post('/api/user/claim', async (req, res) => {
 
     const { userAddress, marketId, transactionHash } = req.body;
 
-    if (!userAddress || marketId === undefined) {
+    // Validate required fields
+    if (!userAddress || typeof userAddress !== 'string' || !userAddress.trim()) {
       return res.status(400).json({
         success: false,
-        error: 'userAddress and marketId are required'
+        error: 'userAddress is required and must be a non-empty string'
       });
     }
 
-    console.log(`💰 Claim request: User ${userAddress}, Market #${marketId}, TX: ${transactionHash}`);
+    if (marketId === undefined || marketId === null || marketId === '') {
+      return res.status(400).json({
+        success: false,
+        error: 'marketId is required'
+      });
+    }
+
+    const parsedMarketId = parseInt(marketId);
+    if (isNaN(parsedMarketId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'marketId must be a valid number'
+      });
+    }
+
+    console.log(`💰 Claim request: User ${userAddress}, Market #${parsedMarketId}, TX: ${transactionHash || 'N/A'}`);
 
     // Update the bet as claimed
     const { data, error } = await supabase
       .from('user_bets')
       .update({ claimed: true })
       .eq('user_address', userAddress.toLowerCase())
-      .eq('market_id', parseInt(marketId))
+      .eq('market_id', parsedMarketId)
       .eq('won', true)
       .select();
 
@@ -1983,7 +2309,7 @@ app.post('/api/user/claim', async (req, res) => {
       });
     }
 
-    console.log(`✅ Bet claimed: Market #${marketId}, User ${userAddress}`);
+    console.log(`✅ Bet claimed: Market #${parsedMarketId}, User ${userAddress}`);
 
     res.json({
       success: true,
@@ -2965,7 +3291,12 @@ app.post('/api/admin/resolve-market', async (req, res) => {
         });
       }
 
-      const inkMetrics = await getInkChainMetrics(metricType, market.inkContractAddress || null);
+      // Pass market info for time-based metrics (like active_wallets)
+      const marketInfo = {
+        createdAt: market.createdAt,
+        deadline: market.deadline
+      };
+      const inkMetrics = await getInkChainMetrics(metricType, market.inkContractAddress || null, marketInfo);
       if (inkMetrics && inkMetrics.value !== undefined) {
         actualMetric = typeof inkMetrics.value === 'number' ? inkMetrics.value : parseInt(inkMetrics.value);
       } else {
