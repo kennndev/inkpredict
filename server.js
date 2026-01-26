@@ -1762,6 +1762,7 @@ app.get('/api/user/:address/bets', async (req, res) => {
         const formattedBets = bets.map(bet => {
           const prediction = predictionsMap[bet.prediction_id];
           return {
+            id: bet.id, // Include unique ID for React keys
             marketId: bet.market_id.toString(),
             amount: bet.amount,
             position: bet.position,
@@ -1809,6 +1810,7 @@ app.get('/api/user/:address/bets', async (req, res) => {
 
             // Merge the data
             const formattedBets = betsOnly.map(bet => ({
+              id: bet.id, // Include unique ID for React keys
               marketId: bet.market_id.toString(),
               amount: bet.amount,
               position: bet.position,
@@ -2307,12 +2309,13 @@ app.post('/api/user/claim', async (req, res) => {
     console.log(`💰 Claim request: User ${userAddress}, Market #${parsedMarketId}, TX: ${transactionHash || 'N/A'}`);
 
     // Update the bet as claimed
-    const { data, error } = await supabase
+    // Handle both boolean and string values for 'won' field
+    const { data, error, count } = await supabase
       .from('user_bets')
       .update({ claimed: true })
       .eq('user_address', userAddress.toLowerCase())
       .eq('market_id', parsedMarketId)
-      .eq('won', true)
+      .in('won', [true, 'true', 'TRUE', 1, '1'])
       .select();
 
     if (error) {
@@ -2321,13 +2324,31 @@ app.post('/api/user/claim', async (req, res) => {
     }
 
     if (!data || data.length === 0) {
+      // Log diagnostic info to help debug
+      const { data: diagnosticData } = await supabase
+        .from('user_bets')
+        .select('id, won, claimed, user_address, market_id')
+        .eq('user_address', userAddress.toLowerCase())
+        .eq('market_id', parsedMarketId);
+      
+      console.warn(`⚠️ No rows updated for claim. Diagnostic:`, {
+        userAddress: userAddress.toLowerCase(),
+        marketId: parsedMarketId,
+        matchingBets: diagnosticData,
+        wonValues: diagnosticData?.map(b => ({ id: b.id, won: b.won, wonType: typeof b.won }))
+      });
+
       return res.status(404).json({
         success: false,
-        error: 'No winning bet found for this user and market'
+        error: 'No winning bet found for this user and market',
+        diagnostic: {
+          matchingBets: diagnosticData?.length || 0,
+          wonValues: diagnosticData?.map(b => ({ id: b.id, won: b.won, wonType: typeof b.won }))
+        }
       });
     }
 
-    console.log(`✅ Bet claimed: Market #${parsedMarketId}, User ${userAddress}`);
+    console.log(`✅ Bet claimed: Market #${parsedMarketId}, User ${userAddress}, Updated ${data.length} row(s)`);
 
     res.json({
       success: true,
