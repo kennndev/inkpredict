@@ -196,7 +196,7 @@ async function getBlockAtTimestamp(targetTimestamp, maxIterations = 50) {
       if (blockTimestampCache.has(mid)) {
         block = blockTimestampCache.get(mid);
       } else {
-        try {
+        try {we
           block = await provider.getBlock(mid);
           // Cache recent blocks (within last 1000 blocks)
           if (mid > latestBlock.number - 1000) {
@@ -833,10 +833,20 @@ async function resolveExpiredMarkets() {
       return { resolved: 0, errors: [] };
     }
 
+    // For free cron services with 30s timeout, limit to 3 markets per run
+    // This ensures we complete within the timeout
+    const MAX_MARKETS_PER_RUN = 3;
+    const marketsToProcess = expiredMarketIds.slice(0, MAX_MARKETS_PER_RUN);
+    
+    if (expiredMarketIds.length > MAX_MARKETS_PER_RUN) {
+      console.log(`⚠️ Limiting to ${MAX_MARKETS_PER_RUN} markets per run (${expiredMarketIds.length} total expired)`);
+      console.log(`   Remaining ${expiredMarketIds.length - MAX_MARKETS_PER_RUN} will be processed in next run`);
+    }
+
     let resolvedCount = 0;
     const errors = [];
 
-    for (const marketId of expiredMarketIds) {
+    for (const marketId of marketsToProcess) {
       try {
         const market = await contract.markets(marketId);
         const tweetId = market.tweetId;
@@ -950,7 +960,9 @@ async function resolveExpiredMarkets() {
 
         resolvedCount++;
 
-        await new Promise(resolve => setTimeout(resolve, 2000));
+        // Reduced delay for faster processing (was 2000ms, now 500ms)
+        // This helps stay within 30s timeout for free cron services
+        await new Promise(resolve => setTimeout(resolve, 500));
       } catch (error) {
         console.error(`❌ Error resolving market ${marketId}:`, error.message);
         errors.push({ marketId, error: error.message });
@@ -1000,14 +1012,20 @@ app.post('/api/oracle/resolve', async (req, res) => {
     }
 
     console.log('🔮 Oracle resolution triggered via API');
-    const result = await resolveExpiredMarkets();
-
-    res.json({
+    
+    // For free cron services with 30s timeout, process asynchronously
+    // Return immediately and process in background
+    res.status(202).json({
       success: true,
-      resolved: result.resolved,
-      errors: result.errors,
+      message: 'Resolution process started',
       timestamp: new Date().toISOString()
     });
+
+    // Process markets in background (don't await - let it run async)
+    resolveExpiredMarkets().catch(error => {
+      console.error('Error in background resolution:', error);
+    });
+    
   } catch (error) {
     console.error('Error in oracle resolution endpoint:', error);
     res.status(500).json({
@@ -1039,14 +1057,20 @@ app.get('/api/oracle/resolve', async (req, res) => {
     }
 
     console.log('🔮 Oracle resolution triggered via API (GET)');
-    const result = await resolveExpiredMarkets();
-
-    res.json({
+    
+    // For free cron services with 30s timeout, process asynchronously
+    // Return immediately and process in background
+    res.status(202).json({
       success: true,
-      resolved: result.resolved,
-      errors: result.errors,
+      message: 'Resolution process started',
       timestamp: new Date().toISOString()
     });
+
+    // Process markets in background (don't await - let it run async)
+    resolveExpiredMarkets().catch(error => {
+      console.error('Error in background resolution:', error);
+    });
+    
   } catch (error) {
     console.error('Error in oracle resolution endpoint:', error);
     res.status(500).json({
