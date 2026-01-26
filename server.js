@@ -202,7 +202,10 @@ async function getInkChainMetrics(metricType, contractAddress = null) {
       case 'gas_price': {
         const gasPrice = await provider.getGasPrice();
         const gwei = parseFloat(ethers.utils.formatUnits(gasPrice, 'gwei'));
-        return { value: Math.floor(gwei), unit: 'gwei' };
+        // Ensure we return at least 1 if gas price is very low (not 0)
+        const value = Math.max(1, Math.floor(gwei));
+        console.log(`Gas price: ${gwei} gwei → ${value} (rounded)`);
+        return { value, unit: 'gwei' };
       }
 
       case 'active_wallets': {
@@ -265,6 +268,24 @@ async function getInkChainMetrics(metricType, contractAddress = null) {
           console.error(`⚠️ Twitter metric type "${metricType}" used for Ink Chain prediction. Ink Chain metrics: transactions, block_number, tvl, gas_price, active_wallets`);
           return null;
         }
+        
+        // Try to map common aliases to supported metrics
+        const metricAliases = {
+          'users': 'active_wallets',
+          'user': 'active_wallets',
+          'wallets': 'active_wallets',
+          'wallet': 'active_wallets',
+          'contracts': 'transactions', // Approximate mapping
+          'contract': 'transactions',
+        };
+        
+        const mappedMetric = metricAliases[metricType.toLowerCase()];
+        if (mappedMetric) {
+          console.log(`⚠️ Mapping "${metricType}" to "${mappedMetric}" for Ink Chain prediction`);
+          // Recursively call with mapped metric
+          return await getInkChainMetrics(mappedMetric, contractAddress);
+        }
+        
         console.error(`Unknown metric type: ${metricType}. Supported Ink Chain metrics: transactions, block_number, tvl, gas_price, active_wallets`);
         return null;
     }
@@ -503,10 +524,18 @@ async function resolveExpiredMarkets() {
         const tweetId = market.tweetId;
         const targetMetric = market.targetMetric.toNumber();
         const metricType = market.metricType;
+        const totalPool = market.yesPool.add(market.noPool);
+
+        // Skip markets with no bets (contract will revert with "No bets placed")
+        if (totalPool.isZero()) {
+          console.log(`⏭️  Skipping Market #${marketId}: No bets placed`);
+          continue;
+        }
 
         console.log(`\n--- Resolving Market #${marketId} ---`);
         console.log(`Tweet ID: ${tweetId}`);
         console.log(`Target: ${targetMetric} ${metricType}s`);
+        console.log(`Total Pool: ${ethers.utils.formatUnits(totalPool, 6)} USDC`);
 
         let actualMetric = 0;
 
