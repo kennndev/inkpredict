@@ -552,8 +552,21 @@ async function resolveExpiredMarkets() {
 
         let actualMetric = 0;
 
+        // Detect Ink Chain markets:
+        // 1. tweetId starts with 'ink_'
+        // 2. metricType is an Ink Chain metric (not Twitter metrics)
+        // 3. tweetId is not numeric (Twitter IDs are numeric strings)
+        const inkChainMetrics = ['transactions', 'transaction', 'block_number', 'block_number_count', 'tvl', 'tvl_value', 'gas_price', 'gas_prices', 'active_wallets', 'users', 'user', 'wallets', 'wallet', 'contracts', 'contract'];
+        const twitterMetrics = ['like', 'likes', 'retweet', 'retweets', 'reply', 'replies', 'view', 'views', 'bookmark', 'bookmarks'];
+        const isNumericTweetId = /^\d+$/.test(tweetId);
+        
+        const isInkChainMarket = 
+          tweetId.startsWith('ink_') ||
+          (inkChainMetrics.includes(metricType.toLowerCase()) && !twitterMetrics.includes(metricType.toLowerCase())) ||
+          (!isNumericTweetId && !twitterMetrics.includes(metricType.toLowerCase()));
+
         // Handle Ink Chain predictions
-        if (tweetId.startsWith('ink_')) {
+        if (isInkChainMarket) {
           console.log('⛓️ Fetching Ink Chain metrics...');
           const inkMetrics = await getInkChainMetrics(metricType, market.inkContractAddress || null);
           if (inkMetrics && inkMetrics.value !== undefined) {
@@ -1346,8 +1359,8 @@ app.get('/api/market/:id/bets', async (req, res) => {
         .from('user_bets')
         .select('*')
         .eq('market_id', marketId)
-        .order('created_at', { ascending: false })
-        .limit(50); // Limit to recent 50 bets
+        .order('created_at', { ascending: false });
+        // No limit - show all bets for complete history
 
       if (!betsError && bets) {
         const formattedBets = bets.map(bet => ({
@@ -1359,7 +1372,8 @@ app.get('/api/market/:id/bets', async (req, res) => {
           timestamp: bet.created_at ? new Date(bet.created_at).getTime() : Date.now(),
           claimed: bet.claimed || false,
           won: bet.won,
-          payout: bet.payout
+          payout: bet.payout,
+          resolved: bet.won !== null && bet.won !== undefined // Market is resolved if won is not null
         }));
 
         return res.json({ success: true, bets: formattedBets });
