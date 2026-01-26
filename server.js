@@ -600,9 +600,28 @@ async function resolveExpiredMarkets() {
         }
 
         const outcome = actualMetric >= targetMetric;
+        const winningPool = outcome ? market.yesPool : market.noPool;
 
         console.log(`Actual: ${actualMetric} ${metricType}s`);
         console.log(`Outcome: ${outcome ? '✅ YES (Target Reached)' : '❌ NO (Target Not Reached)'}`);
+        console.log(`Winning Pool: ${ethers.utils.formatUnits(winningPool, 6)} USDC`);
+
+        // Check if there are bets on the winning side
+        if (winningPool.isZero()) {
+          console.log(`⚠️ Market #${marketId}: No bets on winning side (all bets lost). Marking as resolved in database only.`);
+          
+          // Still update Supabase to mark market as resolved (all bets lost)
+          try {
+            await updateSupabaseAfterResolution(marketId, outcome, actualMetric, market);
+            console.log(`✅ Market #${marketId} marked as resolved in database (no winners)`);
+          } catch (dbError) {
+            console.warn('⚠️ Failed to update Supabase:', dbError.message);
+          }
+          
+          // Don't try to resolve on-chain (contract will revert)
+          resolvedCount++;
+          continue;
+        }
 
         // Resolve on-chain
         console.log('⛓️ Submitting resolution to blockchain...');
