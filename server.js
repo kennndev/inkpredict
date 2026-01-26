@@ -472,7 +472,8 @@ async function updateSupabaseAfterResolution(marketId, outcome, actualMetric, ma
           const totalLosses = userBets.filter(b => b.won === false).length;
           const totalVolume = userBets.reduce((sum, b) => sum + parseFloat(b.amount || 0), 0);
           const totalWinnings = userBets.reduce((sum, b) => sum + parseFloat(b.payout || 0), 0);
-          const winRate = totalBets > 0 ? (totalWins / totalBets) * 100 : 0;
+          const resolvedBets = totalWins + totalLosses;
+          const winRate = resolvedBets > 0 ? (totalWins / resolvedBets) * 100 : 0;
           const lastBetAt = userBets.length > 0 ? userBets[userBets.length - 1].created_at : null;
 
           await supabase
@@ -488,6 +489,18 @@ async function updateSupabaseAfterResolution(marketId, outcome, actualMetric, ma
               last_bet_at: lastBetAt,
               updated_at: new Date().toISOString()
             }, { onConflict: 'user_address' });
+
+          // Check and award achievements after stats update
+          try {
+            await checkAndAwardAchievements(supabase, userAddress, {
+              total_bets: totalBets,
+              total_wins: totalWins,
+              total_losses: totalLosses,
+              win_rate: winRate
+            });
+          } catch (achievementError) {
+            console.error(`Error checking achievements for ${userAddress}:`, achievementError);
+          }
         }
       }
 
@@ -1092,6 +1105,234 @@ app.get('/api/market/:id', async (req, res) => {
 });
 
 /**
+ * Helper function to check and award achievements based on user stats
+ */
+async function checkAndAwardAchievements(supabase, userAddress, stats) {
+  const achievements = [];
+  const userAddressLower = userAddress.toLowerCase();
+
+  // Achievement definitions matching Achievements.jsx
+  const achievementDefs = {
+    // Betting milestones
+    first_bet: { threshold: 1, xp: 50, check: () => stats.total_bets >= 1 },
+    bet_10: { threshold: 10, xp: 100, check: () => stats.total_bets >= 10 },
+    bet_50: { threshold: 50, xp: 250, check: () => stats.total_bets >= 50 },
+    bet_100: { threshold: 100, xp: 500, check: () => stats.total_bets >= 100 },
+    bet_500: { threshold: 500, xp: 1000, check: () => stats.total_bets >= 500 },
+    
+    // Winning achievements
+    first_win: { threshold: 1, xp: 75, check: () => stats.total_wins >= 1 },
+    win_10: { threshold: 10, xp: 200, check: () => stats.total_wins >= 10 },
+    win_50: { threshold: 50, xp: 500, check: () => stats.total_wins >= 50 },
+    win_rate_60: { 
+      threshold: 0.6, 
+      xp: 300, 
+      check: () => {
+        const resolvedBets = stats.total_wins + stats.total_losses;
+        return resolvedBets >= 20 && stats.win_rate >= 60;
+      }
+    }
+  };
+
+  // Check each achievement
+  for (const [achievementId, def] of Object.entries(achievementDefs)) {
+    if (!def.check()) continue;
+
+    // Check if already unlocked
+    const { data: existing } = await supabase
+      .from('user_achievements')
+      .select('achievement_id')
+      .eq('user_address', userAddressLower)
+      .eq('achievement_id', achievementId)
+      .single();
+
+    if (existing) continue; // Already unlocked
+
+    // Award achievement
+    const { error: insertError } = await supabase
+      .from('user_achievements')
+      .insert([{
+        user_address: userAddressLower,
+        achievement_id: achievementId,
+        xp_earned: def.xp,
+        unlocked_at: new Date().toISOString()
+      }]);
+
+    if (!insertError) {
+      // Award XP manually (same approach as referrals)
+      const { data: stats } = await supabase
+        .from('user_stats')
+        .select('xp')
+        .eq('user_address', userAddressLower)
+        .single();
+
+      const currentXp = stats?.xp || 0;
+      const { error: xpError } = await supabase
+        .from('user_stats')
+        .upsert({
+          user_address: userAddressLower,
+          xp: currentXp + def.xp,
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'user_address' });
+
+      if (xpError) {
+        console.error(`Error awarding XP for ${achievementId}:`, xpError);
+      } else {
+        console.log(`🏆 Achievement unlocked: ${achievementId} (+${def.xp} XP)`);
+        achievements.push({ id: achievementId, xp: def.xp });
+      }
+    }
+  }
+
+  return achievements;
+}
+
+/**
+ * GET /api/market/:id/comments - Get comments for a specific market
+ */
+app.get('/api/market/:id/comments', async (req, res) => {
+  try {
+    const marketId = req.params.id;
+    const supabase = require('./supabase-client');
+
+    if (!supabase) {
+      return res.json({ success: true, comments: [] });
+    }
+
+    const { data: comments, error } = await supabase
+      .from('market_comments')
+      .select('*')
+      .eq('market_id', marketId)
+      .order('created_at', { ascending: false });
+
+    if (error) {
+      // If table doesn't exist, return empty array
+      if (error.code === 'PGRST205') {
+        return res.json({ success: true, comments: [] });
+      }
+      console.error('Error fetching comments:', error);
+      return res.status(500).json({ success: false, error: error.message });
+    }
+
+    // Format comments for frontend
+    const formattedComments = (comments || []).map(comment => ({
+      id: comment.id,
+      user: `${comment.user_address.slice(0, 6)}...${comment.user_address.slice(-4)}`,
+      content: comment.content,
+      timestamp: new Date(comment.created_at).getTime(),
+      position: comment.position
+    }));
+
+    res.json({ success: true, comments: formattedComments });
+  } catch (error) {
+    console.error('Error fetching comments:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
+ * POST /api/market/:id/comments - Post a comment on a market
+ */
+app.post('/api/market/:id/comments', async (req, res) => {
+  try {
+    const marketId = req.params.id;
+    const { userAddress, content } = req.body;
+    const supabase = require('./supabase-client');
+
+    if (!supabase) {
+      return res.status(503).json({ success: false, error: 'Database not available' });
+    }
+
+    if (!userAddress || !content || !content.trim()) {
+      return res.status(400).json({ success: false, error: 'userAddress and content are required' });
+    }
+
+    if (content.length > 500) {
+      return res.status(400).json({ success: false, error: 'Comment must be 500 characters or less' });
+    }
+
+    const userAddressLower = userAddress.toLowerCase();
+
+    // Check if user has bet on this market to determine position
+    const { data: userBet } = await supabase
+      .from('user_bets')
+      .select('position')
+      .eq('market_id', marketId)
+      .eq('user_address', userAddressLower)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .single();
+
+    // Insert comment
+    const { data: comment, error: insertError } = await supabase
+      .from('market_comments')
+      .insert([{
+        market_id: parseInt(marketId),
+        user_address: userAddressLower,
+        content: content.trim(),
+        position: userBet?.position || null,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
+      }])
+      .select()
+      .single();
+
+    if (insertError) {
+      if (insertError.code === 'PGRST205') {
+        return res.status(500).json({ success: false, error: 'Comments table not found. Please create the market_comments table.' });
+      }
+      console.error('Error posting comment:', insertError);
+      return res.status(500).json({ success: false, error: insertError.message });
+    }
+
+    // Award 5 XP for commenting
+    const COMMENT_XP = 5;
+    
+    // Get current XP
+    const { data: userStats } = await supabase
+      .from('user_stats')
+      .select('xp')
+      .eq('user_address', userAddressLower)
+      .single();
+
+    const currentXp = userStats?.xp || 0;
+    
+    // Update XP in user_stats
+    const { error: xpError } = await supabase
+      .from('user_stats')
+      .upsert({
+        user_address: userAddressLower,
+        xp: currentXp + COMMENT_XP,
+        updated_at: new Date().toISOString()
+      }, { onConflict: 'user_address' });
+
+    if (xpError) {
+      console.error('Error awarding XP for comment:', xpError);
+    } else {
+      console.log(`💬 Comment posted by ${userAddressLower} on market ${marketId} (+${COMMENT_XP} XP)`);
+    }
+
+    // Format response
+    const formattedComment = {
+      id: comment.id,
+      user: `${comment.user_address.slice(0, 6)}...${comment.user_address.slice(-4)}`,
+      content: comment.content,
+      timestamp: new Date(comment.created_at).getTime(),
+      position: comment.position
+    };
+
+    res.json({ 
+      success: true, 
+      comment: formattedComment,
+      xpAwarded: COMMENT_XP
+    });
+  } catch (error) {
+    console.error('Error posting comment:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
  * GET /api/market/:id/bets - Get recent bets for a specific market
  */
 app.get('/api/market/:id/bets', async (req, res) => {
@@ -1598,62 +1839,55 @@ app.post('/api/user/bet', async (req, res) => {
         return res.status(500).json({ success: false, error: betError.message });
       }
 
+      // Check and award achievements based on updated stats
       let achievementUnlocked = null;
       let xpAwarded = 0;
-      const FIRST_BET_XP = 50;
 
       try {
-        const { count: totalBets, error: countError } = await supabase
-          .from('user_bets')
-          .select('*', { count: 'exact', head: true })
-          .eq('user_address', userAddress.toLowerCase());
+        // Get updated user stats after this bet
+        const { data: stats } = await supabase
+          .from('user_stats')
+          .select('total_bets, total_wins, total_losses, win_rate, xp')
+          .eq('user_address', userAddress.toLowerCase())
+          .single();
 
-        if (!countError && totalBets === 1) {
-          const { data: existingAchievement, error: achievementError } = await supabase
-            .from('user_achievements')
-            .select('achievement_id')
-            .eq('user_address', userAddress.toLowerCase())
-            .eq('achievement_id', 'first_bet')
-            .single();
+        if (stats) {
+          // Check all achievements
+          const achievements = await checkAndAwardAchievements(supabase, userAddress, {
+            total_bets: stats.total_bets || 0,
+            total_wins: stats.total_wins || 0,
+            total_losses: stats.total_losses || 0,
+            win_rate: stats.win_rate || 0
+          });
 
-          const alreadyUnlocked = !!existingAchievement;
-          const notFound = achievementError && achievementError.code === 'PGRST116';
+          if (achievements.length > 0) {
+            // Return the first achievement unlocked (most relevant)
+            achievementUnlocked = achievements[0].id;
+            xpAwarded = achievements.reduce((sum, a) => sum + a.xp, 0);
+          }
+        } else {
+          // First bet - stats might not exist yet, check manually
+          const { count: totalBets } = await supabase
+            .from('user_bets')
+            .select('*', { count: 'exact', head: true })
+            .eq('user_address', userAddress.toLowerCase());
 
-          if (!alreadyUnlocked && (notFound || !achievementError)) {
-            const { error: insertAchievementError } = await supabase
-              .from('user_achievements')
-              .insert([{
-                user_address: userAddress.toLowerCase(),
-                achievement_id: 'first_bet',
-                xp_earned: FIRST_BET_XP,
-                unlocked_at: new Date().toISOString()
-              }]);
+          if (totalBets === 1) {
+            const achievements = await checkAndAwardAchievements(supabase, userAddress, {
+              total_bets: 1,
+              total_wins: 0,
+              total_losses: 0,
+              win_rate: 0
+            });
 
-            if (insertAchievementError) {
-              console.error('Error unlocking first_bet achievement:', insertAchievementError);
-            } else {
-              const { data: stats } = await supabase
-                .from('user_stats')
-                .select('xp')
-                .eq('user_address', userAddress.toLowerCase())
-                .single();
-
-              const currentXp = stats?.xp || 0;
-              await supabase
-                .from('user_stats')
-                .upsert({
-                  user_address: userAddress.toLowerCase(),
-                  xp: currentXp + FIRST_BET_XP,
-                  updated_at: new Date().toISOString()
-                }, { onConflict: 'user_address' });
-
-              achievementUnlocked = 'first_bet';
-              xpAwarded = FIRST_BET_XP;
+            if (achievements.length > 0) {
+              achievementUnlocked = achievements[0].id;
+              xpAwarded = achievements[0].xp;
             }
           }
         }
       } catch (achievementFlowError) {
-        console.error('Error handling first bet achievement:', achievementFlowError);
+        console.error('Error checking achievements:', achievementFlowError);
       }
 
       console.log(`✅ Bet recorded: User ${userAddress}, Market ${marketId}, Amount ${amount} USDC, Position ${position ? 'YES' : 'NO'}`);
