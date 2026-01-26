@@ -1063,6 +1063,51 @@ app.get('/api/market/:id', async (req, res) => {
 });
 
 /**
+ * GET /api/market/:id/bets - Get recent bets for a specific market
+ */
+app.get('/api/market/:id/bets', async (req, res) => {
+  try {
+    const marketId = req.params.id;
+    const supabase = require('./supabase-client');
+
+    // Try to fetch from Supabase first
+    if (supabase) {
+      const { data: bets, error: betsError } = await supabase
+        .from('user_bets')
+        .select('*')
+        .eq('market_id', marketId)
+        .order('created_at', { ascending: false })
+        .limit(50); // Limit to recent 50 bets
+
+      if (!betsError && bets) {
+        const formattedBets = bets.map(bet => ({
+          id: bet.id,
+          userAddress: bet.user_address,
+          amount: bet.amount?.toString() || '0',
+          position: bet.position === true || bet.position === 'true' || bet.position === 'YES',
+          createdAt: bet.created_at,
+          timestamp: bet.created_at ? new Date(bet.created_at).getTime() : Date.now(),
+          claimed: bet.claimed || false,
+          won: bet.won,
+          payout: bet.payout
+        }));
+
+        return res.json({ success: true, bets: formattedBets });
+      } else if (betsError) {
+        console.error('Supabase bets error:', betsError);
+      }
+    }
+
+    // Fallback: fetch from blockchain (if we have events or need to query contract)
+    // For now, return empty array if Supabase fails
+    res.json({ success: true, bets: [] });
+  } catch (error) {
+    console.error('Error fetching recent bets:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
  * GET /api/user/:address/bets - Get user bets
  */
 app.get('/api/user/:address/bets', async (req, res) => {
