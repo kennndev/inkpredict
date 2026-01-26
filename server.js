@@ -1550,13 +1550,13 @@ app.post('/api/user/bet', async (req, res) => {
       .eq('market_id', marketId)
       .single();
 
-    // Insert bet record
-    const { data: bet, error: betError } = await supabase
-      .from('user_bets')
-      .insert([{
-        user_address: userAddress.toLowerCase(),
-        market_id: marketId,
-        prediction_id: prediction?.id || null,
+      // Insert bet record
+      const { data: bet, error: betError } = await supabase
+        .from('user_bets')
+        .insert([{
+          user_address: userAddress.toLowerCase(),
+          market_id: marketId,
+          prediction_id: prediction?.id || null,
         amount: parseFloat(amount),
         position: position,
         claimed: false,
@@ -1564,17 +1564,77 @@ app.post('/api/user/bet', async (req, res) => {
       }])
       .select();
 
-    if (betError) {
-      console.error('Error recording bet:', betError);
-      return res.status(500).json({ success: false, error: betError.message });
-    }
+      if (betError) {
+        console.error('Error recording bet:', betError);
+        return res.status(500).json({ success: false, error: betError.message });
+      }
 
-    console.log(`✅ Bet recorded: User ${userAddress}, Market ${marketId}, Amount ${amount} USDC, Position ${position ? 'YES' : 'NO'}`);
+      let achievementUnlocked = null;
+      let xpAwarded = 0;
+      const FIRST_BET_XP = 50;
 
-    res.json({
-      success: true,
-      bet: bet[0]
-    });
+      try {
+        const { count: totalBets, error: countError } = await supabase
+          .from('user_bets')
+          .select('*', { count: 'exact', head: true })
+          .eq('user_address', userAddress.toLowerCase());
+
+        if (!countError && totalBets === 1) {
+          const { data: existingAchievement, error: achievementError } = await supabase
+            .from('user_achievements')
+            .select('achievement_id')
+            .eq('user_address', userAddress.toLowerCase())
+            .eq('achievement_id', 'first_bet')
+            .single();
+
+          const alreadyUnlocked = !!existingAchievement;
+          const notFound = achievementError && achievementError.code === 'PGRST116';
+
+          if (!alreadyUnlocked && (notFound || !achievementError)) {
+            const { error: insertAchievementError } = await supabase
+              .from('user_achievements')
+              .insert([{
+                user_address: userAddress.toLowerCase(),
+                achievement_id: 'first_bet',
+                xp_earned: FIRST_BET_XP,
+                unlocked_at: new Date().toISOString()
+              }]);
+
+            if (insertAchievementError) {
+              console.error('Error unlocking first_bet achievement:', insertAchievementError);
+            } else {
+              const { data: stats } = await supabase
+                .from('user_stats')
+                .select('xp')
+                .eq('user_address', userAddress.toLowerCase())
+                .single();
+
+              const currentXp = stats?.xp || 0;
+              await supabase
+                .from('user_stats')
+                .upsert({
+                  user_address: userAddress.toLowerCase(),
+                  xp: currentXp + FIRST_BET_XP,
+                  updated_at: new Date().toISOString()
+                }, { onConflict: 'user_address' });
+
+              achievementUnlocked = 'first_bet';
+              xpAwarded = FIRST_BET_XP;
+            }
+          }
+        }
+      } catch (achievementFlowError) {
+        console.error('Error handling first bet achievement:', achievementFlowError);
+      }
+
+      console.log(`✅ Bet recorded: User ${userAddress}, Market ${marketId}, Amount ${amount} USDC, Position ${position ? 'YES' : 'NO'}`);
+
+      res.json({
+        success: true,
+        bet: bet[0],
+        achievementUnlocked,
+        xpAwarded
+      });
   } catch (error) {
     console.error('Error recording bet:', error);
     res.status(500).json({ success: false, error: error.message });
@@ -1844,9 +1904,9 @@ app.get('/api/referrals/:address', async (req, res) => {
       });
     }
 
-    // Get or create referral code
+    // Get referral code from referral_codes table (which already has total_referrals and total_xp_earned)
     let { data: referral, error } = await supabase
-      .from('referrals')
+      .from('referral_codes')
       .select('*')
       .eq('referrer_address', address)
       .single();
@@ -1861,24 +1921,24 @@ app.get('/api/referrals/:address', async (req, res) => {
       });
     } else if (error) {
       console.error('Error fetching referral:', error);
+      // If table doesn't exist, return empty (will be created on first use)
+      if (error.code === 'PGRST205') {
+        return res.json({
+          success: true,
+          code: null,
+          totalReferrals: 0,
+          totalXpEarned: 0
+        });
+      }
       return res.status(500).json({ success: false, error: error.message });
     }
 
-    // Count total referrals (where this user is the referrer and someone has redeemed)
-    const { count: totalReferrals } = await supabase
-      .from('referrals')
-      .select('*', { count: 'exact', head: true })
-      .eq('referrer_address', address)
-      .not('referee_address', 'is', null);
-
-    // Calculate total XP earned (10 XP per referral)
-    const totalXpEarned = (totalReferrals || 0) * 10;
-
+    // Use the already calculated values from the database
     res.json({
       success: true,
       code: referral.code,
-      totalReferrals: totalReferrals || 0,
-      totalXpEarned
+      totalReferrals: referral.total_referrals || 0,
+      totalXpEarned: referral.total_xp_earned || 0
     });
   } catch (error) {
     console.error('Error fetching referral info:', error);
@@ -1929,24 +1989,18 @@ app.post('/api/referrals/create', async (req, res) => {
 
     // Check if referral code already exists
     let { data: existing, error: checkError } = await supabase
-      .from('referrals')
+      .from('referral_codes')
       .select('*')
       .eq('referrer_address', address)
       .single();
 
     if (existing) {
-      // Code already exists, return it
-      const { count: totalReferrals } = await supabase
-        .from('referrals')
-        .select('*', { count: 'exact', head: true })
-        .eq('referrer_address', address)
-        .not('referee_address', 'is', null);
-
+      // Code already exists, return it with current stats
       return res.json({
         success: true,
         code: existing.code,
-        totalReferrals: totalReferrals || 0,
-        totalXpEarned: (totalReferrals || 0) * 10
+        totalReferrals: existing.total_referrals || 0,
+        totalXpEarned: existing.total_xp_earned || 0
       });
     }
 
@@ -1954,13 +2008,17 @@ app.post('/api/referrals/create', async (req, res) => {
     const randomSuffix = Math.random().toString(36).substring(2, 6).toUpperCase();
     const code = `${address.substring(2, 6).toUpperCase()}${randomSuffix}`;
 
-    // Insert referral code
+    // Insert referral code with initial stats
     const { data: newReferral, error: insertError } = await supabase
-      .from('referrals')
+      .from('referral_codes')
       .insert([{
         referrer_address: address,
         code: code,
-        created_at: new Date().toISOString()
+        signature: signature,
+        total_referrals: 0,
+        total_xp_earned: 0,
+        created_at: new Date().toISOString(),
+        updated_at: new Date().toISOString()
       }])
       .select()
       .single();
@@ -1999,9 +2057,9 @@ app.get('/api/referrals/status/:address', async (req, res) => {
       });
     }
 
-    // Check if user has been referred (is a referee)
+    // Check if user has been referred (is a referee) using referral_uses table
     const { data: referral, error } = await supabase
-      .from('referrals')
+      .from('referral_uses')
       .select('*')
       .eq('referee_address', address)
       .single();
@@ -2054,7 +2112,7 @@ app.post('/api/referrals/redeem', async (req, res) => {
 
     // Check if user has already redeemed a referral
     const { data: existingRedeem, error: checkError } = await supabase
-      .from('referrals')
+      .from('referral_uses')
       .select('*')
       .eq('referee_address', address)
       .single();
@@ -2067,13 +2125,13 @@ app.post('/api/referrals/redeem', async (req, res) => {
     }
 
     // Find referral code
-    const { data: referral, error: findError } = await supabase
-      .from('referrals')
+    const { data: referralCode, error: findError } = await supabase
+      .from('referral_codes')
       .select('*')
       .eq('code', codeUpper)
       .single();
 
-    if (findError || !referral) {
+    if (findError || !referralCode) {
       return res.status(404).json({
         success: false,
         error: 'Invalid referral code'
@@ -2081,26 +2139,42 @@ app.post('/api/referrals/redeem', async (req, res) => {
     }
 
     // Can't refer yourself
-    if (referral.referrer_address.toLowerCase() === address) {
+    if (referralCode.referrer_address.toLowerCase() === address) {
       return res.status(400).json({
         success: false,
         error: 'You cannot use your own referral code'
       });
     }
 
-    // Update referral with referee address
-    const { error: updateError } = await supabase
-      .from('referrals')
-      .update({
+    // Record the referral use (with XP amounts)
+    const { error: insertError } = await supabase
+      .from('referral_uses')
+      .insert([{
+        referrer_address: referralCode.referrer_address,
         referee_address: address,
-        redeemed_at: new Date().toISOString()
+        code: codeUpper,
+        xp_referrer: 10,
+        xp_referee: 5,
+        created_at: new Date().toISOString()
+      }]);
+
+    if (insertError) {
+      console.error('Error recording referral use:', insertError);
+      return res.status(500).json({ success: false, error: insertError.message });
+    }
+
+    // Update referral_codes table with new totals
+    const newTotalReferrals = (referralCode.total_referrals || 0) + 1;
+    const newTotalXpEarned = (referralCode.total_xp_earned || 0) + 10;
+    
+    await supabase
+      .from('referral_codes')
+      .update({
+        total_referrals: newTotalReferrals,
+        total_xp_earned: newTotalXpEarned,
+        updated_at: new Date().toISOString()
       })
       .eq('code', codeUpper);
-
-    if (updateError) {
-      console.error('Error updating referral:', updateError);
-      return res.status(500).json({ success: false, error: updateError.message });
-    }
 
     // Award XP to referee (5 XP)
     const { data: refereeStats } = await supabase
@@ -2122,19 +2196,19 @@ app.post('/api/referrals/redeem', async (req, res) => {
     const { data: referrerStats } = await supabase
       .from('user_stats')
       .select('xp')
-      .eq('user_address', referral.referrer_address)
+      .eq('user_address', referralCode.referrer_address)
       .single();
 
     const referrerCurrentXp = referrerStats?.xp || 0;
     await supabase
       .from('user_stats')
       .upsert({
-        user_address: referral.referrer_address,
+        user_address: referralCode.referrer_address,
         xp: referrerCurrentXp + 10,
         updated_at: new Date().toISOString()
       }, { onConflict: 'user_address' });
 
-    console.log(`✅ Referral redeemed: Code ${codeUpper}, Referee ${address}, Referrer ${referral.referrer_address}`);
+    console.log(`✅ Referral redeemed: Code ${codeUpper}, Referee ${address}, Referrer ${referralCode.referrer_address}`);
 
     res.json({
       success: true,
