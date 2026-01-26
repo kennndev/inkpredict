@@ -2182,56 +2182,74 @@ app.post('/api/user/bet', async (req, res) => {
       return res.status(500).json({ success: false, error: betError.message });
     }
 
-      // Check and award achievements based on updated stats
-      let achievementUnlocked = null;
-      let xpAwarded = 0;
+    // Update user_stats immediately with new bet count
+    const userAddressLower = userAddress.toLowerCase();
+    let totalBets = 0;
+    let achievementUnlocked = null;
+    let xpAwarded = 0;
 
-      try {
-        // Get updated user stats after this bet
-        const { data: stats } = await supabase
-          .from('user_stats')
-          .select('total_bets, total_wins, total_losses, win_rate, xp')
-          .eq('user_address', userAddress.toLowerCase())
-          .single();
+    try {
+      // Count all bets for this user (including the one just placed)
+      const { count: betCount, error: countError } = await supabase
+        .from('user_bets')
+        .select('*', { count: 'exact', head: true })
+        .eq('user_address', userAddressLower);
 
-        if (stats) {
-          // Check all achievements
-          const achievements = await checkAndAwardAchievements(supabase, userAddress, {
-            total_bets: stats.total_bets || 0,
-            total_wins: stats.total_wins || 0,
-            total_losses: stats.total_losses || 0,
-            win_rate: stats.win_rate || 0
-          });
-
-          if (achievements.length > 0) {
-            // Return the first achievement unlocked (most relevant)
-            achievementUnlocked = achievements[0].id;
-            xpAwarded = achievements.reduce((sum, a) => sum + a.xp, 0);
-          }
-        } else {
-          // First bet - stats might not exist yet, check manually
-          const { count: totalBets } = await supabase
-            .from('user_bets')
-            .select('*', { count: 'exact', head: true })
-            .eq('user_address', userAddress.toLowerCase());
-
-          if (totalBets === 1) {
-            const achievements = await checkAndAwardAchievements(supabase, userAddress, {
-              total_bets: 1,
-              total_wins: 0,
-              total_losses: 0,
-              win_rate: 0
-            });
-
-            if (achievements.length > 0) {
-              achievementUnlocked = achievements[0].id;
-              xpAwarded = achievements[0].xp;
-            }
-          }
-        }
-      } catch (achievementFlowError) {
-        console.error('Error checking achievements:', achievementFlowError);
+      if (countError) {
+        console.error('Error counting bets:', countError);
+      } else {
+        totalBets = betCount || 0;
       }
+
+      // Get existing stats to preserve other fields
+      const { data: existingStats } = await supabase
+        .from('user_stats')
+        .select('total_wins, total_losses, total_volume, win_rate, xp')
+        .eq('user_address', userAddressLower)
+        .single();
+
+      // Calculate total volume
+      const { data: allBets } = await supabase
+        .from('user_bets')
+        .select('amount')
+        .eq('user_address', userAddressLower);
+
+      const totalVolume = allBets?.reduce((sum, b) => sum + parseFloat(b.amount || 0), 0) || 0;
+
+      // Update user_stats with new bet count
+      await supabase
+        .from('user_stats')
+        .upsert({
+          user_address: userAddressLower,
+          total_bets: totalBets,
+          total_wins: existingStats?.total_wins || 0,
+          total_losses: existingStats?.total_losses || 0,
+          total_volume: totalVolume,
+          total_winnings: existingStats?.total_winnings || 0,
+          win_rate: existingStats?.win_rate || 0,
+          xp: existingStats?.xp || 0,
+          current_streak: existingStats?.current_streak || 0,
+          longest_streak: existingStats?.longest_streak || 0,
+          updated_at: new Date().toISOString()
+        }, { onConflict: 'user_address' });
+
+      // Check and award achievements based on updated stats
+      const achievements = await checkAndAwardAchievements(supabase, userAddress, {
+        total_bets: totalBets,
+        total_wins: existingStats?.total_wins || 0,
+        total_losses: existingStats?.total_losses || 0,
+        win_rate: existingStats?.win_rate || 0
+      });
+
+      if (achievements.length > 0) {
+        // Return the first achievement unlocked (most relevant)
+        achievementUnlocked = achievements[0].id;
+        xpAwarded = achievements.reduce((sum, a) => sum + a.xp, 0);
+        console.log(`🏆 Achievement unlocked: ${achievementUnlocked} (+${xpAwarded} XP)`);
+      }
+    } catch (achievementFlowError) {
+      console.error('Error checking achievements:', achievementFlowError);
+    }
 
     console.log(`✅ Bet recorded: User ${userAddress}, Market ${marketId}, Amount ${amount} USDC, Position ${position ? 'YES' : 'NO'}`);
 
