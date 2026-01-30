@@ -2441,10 +2441,11 @@ app.get('/api/leaderboard', async (req, res) => {
       });
     }
 
-    // Default leaderboard view
+    // Default leaderboard view (sorted by win_rate descending)
     const { data: leaderboard, error } = await supabase
       .from('leaderboard')
       .select('*')
+      .order('win_rate', { ascending: false })
       .limit(100);
 
     if (error) {
