@@ -1062,12 +1062,15 @@ async function resolveExpiredMarkets() {
           
           if (inkMetrics && inkMetrics.value !== undefined) {
             actualMetric = typeof inkMetrics.value === 'number' ? inkMetrics.value : parseInt(inkMetrics.value);
-            console.log(`✅ Fetched metric value: ${actualMetric}`);
+            console.log(`✅ Fetched metric value: ${actualMetric} (type: ${typeof actualMetric})`);
           } else {
-            console.error(`❌ Failed to fetch Ink Chain metrics for market ${marketId} - returned:`, inkMetrics);
+            console.error(`❌ Failed to fetch Ink Chain metrics for market ${marketId}`);
+            console.error(`   - inkMetrics:`, inkMetrics);
+            console.error(`   - metricType: ${metricType}`);
+            console.error(`   - marketInfo:`, marketInfo);
             errors.push({ 
               marketId: marketId.toString(), 
-              error: 'Failed to fetch Ink Chain metrics - returned null or undefined' 
+              error: `Failed to fetch Ink Chain metrics - returned: ${JSON.stringify(inkMetrics)}` 
             });
             continue;
           }
@@ -4072,6 +4075,8 @@ if (require.main === module) {
 }
 
 module.exports = app;
+module.exports.resolveExpiredMarkets = resolveExpiredMarkets;
+module.exports.getInkChainMetrics = getInkChainMetrics;
 
 // ============ Error Handling ============
 
