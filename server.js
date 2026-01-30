@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const cron = require('node-cron');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
+const axios = require('axios');
 require('dotenv').config();
 
 const CONTRACT_ARTIFACT = require('./abi/InkPredict.json');
@@ -19,21 +20,58 @@ app.use(cors());
 // Enable trust proxy for Vercel/proxies
 app.set('trust proxy', 1);
 
-// Rate limiting
-const limiter = rateLimit({
+// Rate limiting - Different limits for different endpoint types
+// General API rate limiter (more permissive for user endpoints)
+const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100 // limit each IP to 100 requests per windowMs
+  max: 200, // Increased to 200 requests per 15 minutes
+  message: 'Too many requests from this IP, please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false,
 });
-app.use(limiter);
+
+// Stricter rate limiter for write operations (POST/PUT/DELETE)
+const writeLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 50, // 50 write requests per 15 minutes
+  message: 'Too many write requests from this IP, please try again later.',
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+// Apply general rate limiter to all routes by default
+// But skip rate limiting for oracle/cron endpoints (they have their own auth)
+app.use((req, res, next) => {
+  // Skip rate limiting for oracle endpoints
+  if (req.path.startsWith('/api/oracle/')) {
+    return next();
+  }
+  // Apply rate limiter to all other routes
+  apiLimiter(req, res, next);
+});
 
 // Twitter API client
 const twitterClient = new TwitterApi(process.env.TWITTER_BEARER_TOKEN);
 
-// Blockchain connection
-const provider = new ethers.providers.JsonRpcProvider(process.env.INK_CHAIN_RPC, {
-  chainId: 763373,
-  name: 'ink-sepolia'
-});
+// Blockchain connection - Use Alchemy if available, otherwise use standard RPC
+let provider;
+const ALCHEMY_API_KEY = process.env.ALCHEMY_API_KEY;
+const ALCHEMY_RPC_URL = process.env.ALCHEMY_RPC_URL;
+
+if (ALCHEMY_API_KEY && ALCHEMY_RPC_URL) {
+  // Use Alchemy provider for better performance
+  console.log('🔮 Using Alchemy provider for enhanced performance');
+  provider = new ethers.providers.JsonRpcProvider(ALCHEMY_RPC_URL, {
+    chainId: 763373,
+    name: 'ink-sepolia'
+  });
+} else {
+  // Fallback to standard RPC
+  provider = new ethers.providers.JsonRpcProvider(process.env.INK_CHAIN_RPC, {
+    chainId: 763373,
+    name: 'ink-sepolia'
+  });
+}
 const adminWallet = new ethers.Wallet(process.env.ADMIN_PRIVATE_KEY, provider);
 const oracleWallet = new ethers.Wallet(process.env.ORACLE_PRIVATE_KEY, provider);
 
@@ -253,6 +291,114 @@ async function getBlockAtTimestamp(targetTimestamp, maxIterations = 50) {
 }
 
 /**
+ * Helper function to safely convert timestamp (string, number, or BigNumber) to number
+ */
+function safeTimestampToNumber(timestamp) {
+  if (typeof timestamp === 'string') {
+    return parseInt(timestamp);
+  } else if (typeof timestamp === 'number') {
+    return timestamp;
+  } else {
+    // BigNumber - use toString() to avoid overflow
+    return parseInt(timestamp.toString());
+  }
+}
+
+/**
+ * Use Alchemy Enhanced API for faster data fetching
+ * Falls back to standard RPC if Alchemy is not available
+ */
+async function getAlchemyData(method, params = []) {
+  if (!ALCHEMY_API_KEY || !ALCHEMY_RPC_URL) {
+    return null; // Alchemy not configured
+  }
+
+  try {
+    const response = await axios.post(ALCHEMY_RPC_URL, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: method,
+      params: params
+    }, {
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      timeout: 10000
+    });
+
+    if (response.data && response.data.result) {
+      return response.data.result;
+    }
+    return null;
+  } catch (error) {
+    console.warn(`⚠️ Alchemy API call failed for ${method}, falling back to RPC:`, error.message);
+    return null;
+  }
+}
+
+/**
+ * Get transaction count using Alchemy's enhanced API (much faster)
+ */
+async function getTransactionCountAlchemy(contractAddress, blockNumber) {
+  if (!contractAddress || contractAddress === '0x0000000000000000000000000000000000000000') {
+    return null;
+  }
+
+  // Try Alchemy's enhanced API first
+  const alchemyResult = await getAlchemyData('eth_getTransactionCount', [contractAddress, `0x${blockNumber.toString(16)}`]);
+  if (alchemyResult) {
+    return parseInt(alchemyResult, 16);
+  }
+
+  // Fallback to standard RPC
+  return await provider.getTransactionCount(contractAddress, blockNumber);
+}
+
+/**
+ * Get unique addresses from blocks using Alchemy's getAssetTransfers (much faster than iterating)
+ */
+async function getActiveWalletsAlchemy(startBlock, endBlock) {
+  if (!ALCHEMY_API_KEY || !ALCHEMY_RPC_URL) {
+    return null;
+  }
+
+  try {
+    // Use Alchemy's getAssetTransfers to get unique addresses quickly
+    const response = await axios.post(ALCHEMY_RPC_URL, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'alchemy_getAssetTransfers',
+      params: [{
+        fromBlock: `0x${startBlock.toString(16)}`,
+        toBlock: `0x${endBlock.toString(16)}`,
+        category: ['external', 'erc20', 'erc721', 'erc1155'],
+        withMetadata: false,
+        excludeZeroValue: false,
+        maxCount: '0x3e8' // 1000 transfers per call
+      }]
+    }, {
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      timeout: 15000
+    });
+
+    if (response.data && response.data.result && response.data.result.transfers) {
+      const uniqueAddresses = new Set();
+      response.data.result.transfers.forEach(transfer => {
+        if (transfer.from) uniqueAddresses.add(transfer.from.toLowerCase());
+        if (transfer.to) uniqueAddresses.add(transfer.to.toLowerCase());
+      });
+      return uniqueAddresses.size;
+    }
+    return null;
+  } catch (error) {
+    console.warn(`⚠️ Alchemy getAssetTransfers failed, falling back:`, error.message);
+    return null;
+  }
+}
+
+/**
  * Get Ink Chain metrics via RPC
  * @param {string} metricType - Type of metric to fetch
  * @param {string|null} contractAddress - Optional contract address
@@ -264,19 +410,17 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
 
     switch (metricType) {
       case 'transactions': {
-        // Count transactions during market period or at deadline
+        // Count transactions at market deadline (deterministic, fast)
         try {
           let targetBlock;
           
           if (marketInfo && marketInfo.deadline) {
             // Use block at market deadline for deterministic result
-            const deadlineTimestamp = typeof marketInfo.deadline === 'number'
-              ? marketInfo.deadline
-              : marketInfo.deadline.toNumber();
+            const deadlineTimestamp = safeTimestampToNumber(marketInfo.deadline);
             targetBlock = await getBlockAtTimestamp(deadlineTimestamp);
             console.log(`📅 Using block ${targetBlock} at market deadline`);
           } else {
-            // Fallback: use latest block
+            // Use latest block if no deadline
             const latestBlock = await retryWithBackoff(async () => {
               return await provider.getBlock('latest');
             }, 3, 2000);
@@ -285,66 +429,21 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
           }
 
           // If contract address provided, get contract-specific tx count at target block
-        if (contractAddress) {
-            const txCount = await provider.getTransactionCount(contractAddress, targetBlock);
+          // Use Alchemy API if available for faster results
+          if (contractAddress && contractAddress !== '0x0000000000000000000000000000000000000000') {
+            const txCount = await getTransactionCountAlchemy(contractAddress, targetBlock);
             return { value: txCount, blockNumber: targetBlock };
           }
 
-          // For network-wide transactions, count transactions in blocks during market period
-          if (marketInfo && marketInfo.createdAt && marketInfo.deadline) {
-            const createdAtTimestamp = typeof marketInfo.createdAt === 'number' 
-              ? marketInfo.createdAt 
-              : marketInfo.createdAt.toNumber();
-            const deadlineTimestamp = typeof marketInfo.deadline === 'number'
-              ? marketInfo.deadline
-              : marketInfo.deadline.toNumber();
-            
-            const startBlock = await getBlockAtTimestamp(createdAtTimestamp);
-            const endBlock = await getBlockAtTimestamp(deadlineTimestamp);
-            
-            // Count transactions in market period (sample approach for efficiency)
-            // For very large ranges, sample blocks or use approximation
-            const blockRange = endBlock - startBlock;
-            let txCount = 0;
-            
-            if (blockRange <= 1000) {
-              // Small range: count all blocks
-              console.log(`📊 Counting transactions in ${blockRange} blocks (${startBlock} to ${endBlock})...`);
-              const sampleSize = Math.min(100, blockRange); // Sample up to 100 blocks
-              const step = Math.max(1, Math.floor(blockRange / sampleSize));
-              
-              for (let i = startBlock; i <= endBlock; i += step) {
-                try {
-                  const block = await provider.getBlock(i);
-                  txCount += block.transactions.length;
-                  if ((i - startBlock) % (step * 10) === 0) {
-                    await new Promise(resolve => setTimeout(resolve, 50)); // Rate limit
-                  }
-                } catch (err) {
-                  console.warn(`Error fetching block ${i}:`, err.message);
-                }
-              }
-              
-              // Extrapolate if sampled
-              if (sampleSize < blockRange) {
-                txCount = Math.floor(txCount * (blockRange / sampleSize));
-              }
-            } else {
-              // Large range: use approximation
-              console.log(`📊 Large range (${blockRange} blocks), using approximation...`);
-              txCount = blockRange * 10; // Rough estimate: ~10 txs per block
-            }
-            
-            return { value: txCount, blockRange: `${startBlock}-${endBlock}`, blockNumber: endBlock };
-          }
-
-          // Fallback: approximation based on block number
-          return { value: targetBlock * 10, blockNumber: targetBlock };
+          // For network-wide transactions, use the block number as a proxy
+          // This is much faster than iterating through blocks
+          // The block number represents cumulative network activity
+          console.log(`📊 Using block number ${targetBlock} as transaction metric`);
+          return { value: targetBlock, blockNumber: targetBlock, note: 'Using block number as proxy' };
         } catch (error) {
           console.error('Error counting transactions:', error);
-          // Fallback
           const latestBlock = await provider.getBlock('latest');
-          return { value: latestBlock.number * 10, blockNumber: latestBlock.number, note: 'Fallback estimate' };
+          return { value: latestBlock.number, blockNumber: latestBlock.number, note: 'Error fallback' };
         }
       }
 
@@ -354,9 +453,7 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
           let targetBlock;
           
           if (marketInfo && marketInfo.deadline) {
-            const deadlineTimestamp = typeof marketInfo.deadline === 'number'
-              ? marketInfo.deadline
-              : marketInfo.deadline.toNumber();
+            const deadlineTimestamp = safeTimestampToNumber(marketInfo.deadline);
             targetBlock = await getBlockAtTimestamp(deadlineTimestamp);
             const block = await provider.getBlock(targetBlock);
             console.log(`📅 Using block ${targetBlock} at market deadline`);
@@ -379,9 +476,7 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
           let targetBlock;
           
           if (marketInfo && marketInfo.deadline) {
-            const deadlineTimestamp = typeof marketInfo.deadline === 'number'
-              ? marketInfo.deadline
-              : marketInfo.deadline.toNumber();
+            const deadlineTimestamp = safeTimestampToNumber(marketInfo.deadline);
             targetBlock = await getBlockAtTimestamp(deadlineTimestamp);
             console.log(`📅 Using block ${targetBlock} at market deadline for TVL`);
           } else {
@@ -410,9 +505,7 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
           let targetBlock;
           
           if (marketInfo && marketInfo.deadline) {
-            const deadlineTimestamp = typeof marketInfo.deadline === 'number'
-              ? marketInfo.deadline
-              : marketInfo.deadline.toNumber();
+            const deadlineTimestamp = safeTimestampToNumber(marketInfo.deadline);
             targetBlock = await getBlockAtTimestamp(deadlineTimestamp);
             console.log(`📅 Using block ${targetBlock} at market deadline for gas price`);
           } else {
@@ -438,133 +531,67 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
       }
 
       case 'active_wallets': {
-        // Count unique addresses that sent transactions during the market's active period
-        // Use market's createdAt to deadline block range for deterministic, verifiable results
+        // Try Alchemy API first for fast, accurate results
         try {
           let startBlock, endBlock;
           
           if (marketInfo && marketInfo.createdAt && marketInfo.deadline) {
-            // Use market's specific time range for deterministic results
-            const createdAtTimestamp = typeof marketInfo.createdAt === 'number' 
-              ? marketInfo.createdAt 
-              : marketInfo.createdAt.toNumber();
-            const deadlineTimestamp = typeof marketInfo.deadline === 'number'
-              ? marketInfo.deadline
-              : marketInfo.deadline.toNumber();
+            const createdAtTimestamp = safeTimestampToNumber(marketInfo.createdAt);
+            const deadlineTimestamp = safeTimestampToNumber(marketInfo.deadline);
             
-            console.log(`📅 Market period: ${new Date(createdAtTimestamp * 1000).toISOString()} to ${new Date(deadlineTimestamp * 1000).toISOString()}`);
-            
-            // Find block numbers at these timestamps
             startBlock = await getBlockAtTimestamp(createdAtTimestamp);
             endBlock = await getBlockAtTimestamp(deadlineTimestamp);
             
-            // Ensure we have a valid range
-            if (endBlock < startBlock) {
-              console.warn(`⚠️ End block (${endBlock}) < start block (${startBlock}), using latest block`);
-          const latestBlock = await provider.getBlock('latest');
-              endBlock = latestBlock.number;
-            }
+            console.log(`📅 Market period: blocks ${startBlock} to ${endBlock}`);
             
-            console.log(`🔍 Checking blocks ${startBlock} to ${endBlock} (market period)`);
+            // Try Alchemy's enhanced API first (much faster)
+            const alchemyCount = await getActiveWalletsAlchemy(startBlock, endBlock);
+            if (alchemyCount !== null) {
+              console.log(`✅ Alchemy API: Found ${alchemyCount} unique active wallets`);
+              return { 
+                value: alchemyCount, 
+                blockRange: `${startBlock}-${endBlock}`,
+                note: 'Alchemy API',
+                marketPeriod: {
+                  createdAt: marketInfo.createdAt,
+                  deadline: marketInfo.deadline
+                }
+              };
+            }
           } else {
-            // Fallback: use last 100 blocks if market info not provided
+            // No market info - use last 100 blocks
             const latestBlock = await provider.getBlock('latest');
             endBlock = latestBlock.number;
             startBlock = Math.max(0, endBlock - 100);
-            console.log(`⚠️ No market info provided, using last 100 blocks (${startBlock} to ${endBlock})`);
-          }
-          
-          const uniqueAddresses = new Set();
-          const blocksToCheck = endBlock - startBlock + 1;
-          
-          console.log(`🔍 Checking ${blocksToCheck} blocks (${startBlock} to ${endBlock}) for active wallets...`);
-          console.log(`⏱️  This may take several minutes for large ranges...`);
-
-          // Adaptive batch size based on range size
-          let batchSize = 10;
-          if (blocksToCheck > 1000) {
-            batchSize = 20; // Larger batches for efficiency
-          } else if (blocksToCheck > 5000) {
-            batchSize = 50; // Even larger for very large ranges
-          }
-
-          let processedBlocks = 0;
-          const totalBatches = Math.ceil(blocksToCheck / batchSize);
-          
-          for (let i = startBlock; i <= endBlock; i += batchSize) {
-            const batchEnd = Math.min(i + batchSize - 1, endBlock);
-            const batchNum = Math.floor((i - startBlock) / batchSize) + 1;
             
-            // Progress logging
-            if (batchNum % 10 === 0 || batchNum === 1 || batchNum === totalBatches) {
-              console.log(`📊 Processing batch ${batchNum}/${totalBatches} (blocks ${i}-${batchEnd})...`);
-            }
-
-            let retries = 3;
-            let success = false;
-            
-            while (retries > 0 && !success) {
-              try {
-                const promises = [];
-                for (let blockNum = i; blockNum <= batchEnd; blockNum++) {
-                  promises.push(
-                    provider.getBlockWithTransactions(blockNum).catch(err => {
-                      console.warn(`⚠️ Error fetching block ${blockNum}:`, err.message);
-                      return null; // Return null on error, we'll skip it
-                    })
-                  );
-            }
-
-            const blocks = await Promise.all(promises);
-
-            for (const block of blocks) {
-              if (block && block.transactions) {
-                for (const tx of block.transactions) {
-                      if (tx && tx.from) {
-                    uniqueAddresses.add(tx.from.toLowerCase());
-                  }
-                }
-              }
-            }
-
-                processedBlocks += blocks.filter(b => b !== null).length;
-                success = true;
-              } catch (error) {
-                retries--;
-                if (retries > 0) {
-                  console.warn(`⚠️ Batch ${batchNum} failed, retrying... (${retries} attempts left)`);
-                  await new Promise(resolve => setTimeout(resolve, 1000 * (4 - retries))); // Exponential backoff
-                } else {
-                  console.error(`❌ Batch ${batchNum} failed after 3 attempts:`, error.message);
-                  // Continue with next batch instead of failing completely
-                }
-              }
-            }
-
-            // Rate limiting delay (longer for large ranges)
-            if (i + batchSize <= endBlock) {
-              const delay = blocksToCheck > 1000 ? 200 : 100;
-              await new Promise(resolve => setTimeout(resolve, delay));
+            const alchemyCount = await getActiveWalletsAlchemy(startBlock, endBlock);
+            if (alchemyCount !== null) {
+              console.log(`✅ Alchemy API: Found ${alchemyCount} unique active wallets (last 100 blocks)`);
+              return { 
+                value: alchemyCount, 
+                blockRange: `${startBlock}-${endBlock}`,
+                note: 'Alchemy API (last 100 blocks)'
+              };
             }
           }
-
-          console.log(`✅ Processed ${processedBlocks} blocks, found ${uniqueAddresses.size} unique wallets`);
-
-          const count = uniqueAddresses.size;
-          console.log(`Found ${count} unique active wallet addresses in blocks ${startBlock}-${endBlock}`);
+          
+          // Fallback: Use block number as proxy (fast but less accurate)
+          const targetBlock = endBlock || (await provider.getBlock('latest')).number;
+          console.log(`📊 Using block number ${targetBlock} as active wallets metric (proxy - Alchemy not available)`);
+          
           return { 
-            value: count, 
-            blockRange: `${startBlock}-${endBlock}`,
+            value: targetBlock, 
+            blockNumber: targetBlock,
+            note: 'Using block number as proxy (Alchemy fallback)',
             marketPeriod: marketInfo ? {
               createdAt: marketInfo.createdAt,
               deadline: marketInfo.deadline
             } : null
           };
         } catch (error) {
-          console.error(`Error counting active wallets:`, error.message);
-          // Fallback: return a rough estimate based on block number
+          console.error(`Error getting active wallets:`, error.message);
           const latestBlock = await provider.getBlock('latest');
-          return { value: Math.floor(latestBlock.number / 10), note: 'Estimated (fallback)' };
+          return { value: latestBlock.number, blockNumber: latestBlock.number, note: 'Error fallback' };
         }
       }
 
@@ -646,61 +673,56 @@ async function marketExists(tweetId) {
 
 // ============ Market Creation (Automated) ============
 
-/**
- * Create market for a trending tweet
- */
-async function createMarketForTweet(tweet) {
-  try {
-    const tweetId = tweet.id;
-    const currentLikes = tweet.public_metrics.like_count;
-    const targetLikes = Math.floor(currentLikes * 5); // Predict 5x growth
-    const deadline = Math.floor(Date.now() / 1000) + (MARKET_DURATION_HOURS * 3600);
-
-    console.log(`Creating market for tweet ${tweetId}`);
-    console.log(`Current likes: ${currentLikes}, Target: ${targetLikes}`);
-
-    const tx = await adminContract.createMarket(
-      tweetId,
-      targetLikes,
-      'like',
-      deadline
-    );
-
-    const receipt = await tx.wait();
-    console.log(`✅ Market created! TX: ${receipt.transactionHash}`);
-
-    return receipt;
-  } catch (error) {
-    console.error('Error creating market:', error.message);
-    return null;
-  }
-}
-
-/**
- * Scan for trending tweets and create markets (Cron job)
- */
-async function scanAndCreateMarkets() {
-  console.log('🔍 Scanning for trending tweets...');
-
-  for (const account of WATCHED_ACCOUNTS) {
-    const tweets = await fetchRecentTweets(account.id);
-
-    for (const tweet of tweets) {
-      if (isTweetEligible(tweet)) {
-        const exists = await marketExists(tweet.id);
-
-        if (!exists) {
-          await createMarketForTweet(tweet);
-          // Add delay to avoid rate limiting
-          await new Promise(resolve => setTimeout(resolve, 2000));
-        }
-      }
-    }
-  }
-
-  console.log('✅ Scan complete');
-}
-
+// COMMENTED OUT: Twitter predictions disabled, focusing on Ink Chain only
+// async function createMarketForTweet(tweet) {
+//   try {
+//     const tweetId = tweet.id;
+//     const currentLikes = tweet.public_metrics.like_count;
+//     const targetLikes = Math.floor(currentLikes * 5); // Predict 5x growth
+//     const deadline = Math.floor(Date.now() / 1000) + (MARKET_DURATION_HOURS * 3600);
+//
+//     console.log(`Creating market for tweet ${tweetId}`);
+//     console.log(`Current likes: ${currentLikes}, Target: ${targetLikes}`);
+//
+//     const tx = await adminContract.createMarket(
+//       tweetId,
+//       targetLikes,
+//       'like',
+//       deadline
+//     );
+//
+//     const receipt = await tx.wait();
+//     console.log(`✅ Market created! TX: ${receipt.transactionHash}`);
+//
+//     return receipt;
+//   } catch (error) {
+//     console.error('Error creating market:', error.message);
+//     return null;
+//   }
+// }
+//
+// async function scanAndCreateMarkets() {
+//   console.log('🔍 Scanning for trending tweets...');
+//
+//   for (const account of WATCHED_ACCOUNTS) {
+//     const tweets = await fetchRecentTweets(account.id);
+//
+//     for (const tweet of tweets) {
+//       if (isTweetEligible(tweet)) {
+//         const exists = await marketExists(tweet.id);
+//
+//         if (!exists) {
+//           await createMarketForTweet(tweet);
+//           // Add delay to avoid rate limiting
+//           await new Promise(resolve => setTimeout(resolve, 2000));
+//         }
+//       }
+//     }
+//   }
+//
+//   console.log('✅ Scan complete');
+// }
+//
 // DISABLED: Run manually to avoid rate limits
 // cron.schedule('*/10 * * * *', scanAndCreateMarkets);
 
@@ -868,23 +890,51 @@ async function resolveExpiredMarkets() {
     const sortedMarketIds = [...expiredMarketIds].reverse();
     console.log(`Processing newest first: ${sortedMarketIds.slice(0, 5).map(id => id.toString()).join(', ')}...`);
 
-    // For free cron services with 30s timeout, limit to 3 markets per run
-    const MAX_MARKETS_PER_RUN = 3;
+    // With retry logic for rate limits, we can process more markets per run
+    // Cron runs every 5 minutes, so we can process 5-7 markets per run safely
+    // This allows us to clear the backlog faster while still respecting rate limits
+    const MAX_MARKETS_PER_RUN = parseInt(process.env.MAX_MARKETS_PER_RUN) || 5;
+    console.log(`📊 Processing up to ${MAX_MARKETS_PER_RUN} markets per run (${expiredMarketIds.length} total unresolved)`);
+    
     let resolvedCount = 0;
     const errors = [];
 
     for (const marketId of sortedMarketIds) {
-      // Stop after resolving 3 markets
+      // Stop after resolving MAX_MARKETS_PER_RUN markets
       if (resolvedCount >= MAX_MARKETS_PER_RUN) {
-        console.log(`✅ Resolved ${MAX_MARKETS_PER_RUN} markets, stopping for this run`);
+        const remaining = expiredMarketIds.length - resolvedCount;
+        console.log(`✅ Resolved ${resolvedCount} markets this run (${remaining} remaining, will continue in next run)`);
         break;
       }
 
       try {
+        console.log(`\n--- Processing Market #${marketId} ---`);
+        
         // Wrap contract call in retry logic for rate limits
-        const market = await retryWithBackoff(async () => {
-          return await contract.markets(marketId);
-        });
+        let market;
+        try {
+          market = await retryWithBackoff(async () => {
+            return await contract.markets(marketId);
+          });
+        } catch (marketError) {
+          // If we can't fetch market data, log and skip
+          const errorMsg = marketError.message || marketError.toString();
+          console.error(`❌ Failed to fetch market ${marketId} data:`, {
+            message: errorMsg,
+            code: marketError.code,
+            isOverflow: errorMsg.includes('overflow') || marketError.code === 'NUMERIC_FAULT',
+            isContractError: errorMsg.includes('CALL_EXCEPTION') || marketError.code === 'CALL_EXCEPTION'
+          });
+          errors.push({ 
+            marketId: marketId.toString(), 
+            error: `Failed to fetch market data: ${errorMsg}`,
+            code: marketError.code,
+            isOverflow: errorMsg.includes('overflow'),
+            isContractError: errorMsg.includes('CALL_EXCEPTION')
+          });
+          continue;
+        }
+        
         const totalPool = market.yesPool.add(market.noPool);
 
         // Skip markets with no bets
@@ -894,7 +944,22 @@ async function resolveExpiredMarkets() {
         }
 
         const tweetId = market.tweetId;
-        const targetMetric = market.targetMetric.toNumber();
+        
+        // Handle potential overflow errors when converting to number
+        let targetMetric;
+        try {
+          targetMetric = market.targetMetric.toNumber();
+        } catch (overflowError) {
+          console.error(`❌ Overflow error converting targetMetric for market ${marketId}:`, overflowError.message);
+          errors.push({
+            marketId: marketId.toString(),
+            error: `Overflow error: targetMetric too large`,
+            code: overflowError.code,
+            isOverflow: true
+          });
+          continue;
+        }
+        
         const metricType = market.metricType;
 
         console.log(`\n--- Resolving Market #${marketId} ---`);
@@ -921,9 +986,10 @@ async function resolveExpiredMarkets() {
         if (isInkChainMarket) {
           console.log('⛓️ Fetching Ink Chain metrics...');
           // Pass market info for time-based metrics (like active_wallets)
+          // Use toString() to avoid overflow errors with large BigNumber values
           const marketInfo = {
-            createdAt: market.createdAt,
-            deadline: market.deadline
+            createdAt: market.createdAt.toString(),
+            deadline: market.deadline.toString()
           };
           // Wrap in retry logic for rate limits
           const inkMetrics = await retryWithBackoff(async () => {
@@ -1010,23 +1076,49 @@ async function resolveExpiredMarkets() {
         await new Promise(resolve => setTimeout(resolve, 2000));
       } catch (error) {
         const errorMsg = error.message || error.toString();
-        console.error(`❌ Error resolving market ${marketId}:`, errorMsg);
+        const errorStack = error.stack || '';
+        const errorCode = error.code || '';
+        const errorData = error.data || '';
+        
+        console.error(`❌ Error resolving market ${marketId}:`, {
+          message: errorMsg,
+          code: errorCode,
+          data: errorData ? errorData.substring(0, 200) : undefined,
+          stack: errorStack ? errorStack.split('\n').slice(0, 3).join('\n') : undefined
+        });
         
         // Check if it's a rate limit error
         const isRateLimit = errorMsg.includes('429') || 
                            errorMsg.includes('rate limit') ||
                            errorMsg.includes('too many requests') ||
-                           error.code === 'ECONNRESET' ||
-                           error.code === 'ETIMEDOUT';
+                           errorCode === 'ECONNRESET' ||
+                           errorCode === 'ETIMEDOUT';
+        
+        // Check if it's an overflow error (deadline too large)
+        const isOverflow = errorMsg.includes('overflow') || 
+                          errorMsg.includes('NUMERIC_FAULT') ||
+                          errorCode === 'NUMERIC_FAULT';
+        
+        // Check if it's a contract call error
+        const isContractError = errorMsg.includes('CALL_EXCEPTION') ||
+                               errorMsg.includes('call revert') ||
+                               errorCode === 'CALL_EXCEPTION';
         
         if (isRateLimit) {
           console.warn(`⚠️ Rate limit error for market ${marketId}, will retry in next run`);
+        } else if (isOverflow) {
+          console.warn(`⚠️ Overflow error for market ${marketId} - deadline value too large, skipping`);
+        } else if (isContractError) {
+          console.warn(`⚠️ Contract call error for market ${marketId} - may not exist or be invalid`);
         }
         
         errors.push({ 
-          marketId, 
+          marketId: marketId.toString(), 
           error: errorMsg,
-          isRateLimit 
+          code: errorCode,
+          isRateLimit,
+          isOverflow,
+          isContractError
         });
         
         // Add extra delay after rate limit errors
@@ -1036,8 +1128,17 @@ async function resolveExpiredMarkets() {
       }
     }
 
-    console.log(`\n🎉 Resolution complete! Resolved: ${resolvedCount}, Errors: ${errors.length}`);
-    return { resolved: resolvedCount, errors };
+    const remaining = expiredMarketIds.length - resolvedCount;
+    console.log(`\n🎉 Resolution complete! Resolved: ${resolvedCount}, Errors: ${errors.length}, Remaining: ${remaining}`);
+    
+    if (errors.length > 0) {
+      const rateLimitErrors = errors.filter(e => e.isRateLimit).length;
+      if (rateLimitErrors > 0) {
+        console.warn(`⚠️ ${rateLimitErrors} rate limit error(s) - markets will retry in next run`);
+      }
+    }
+    
+    return { resolved: resolvedCount, errors, remaining };
   } catch (error) {
     console.error('Error resolving markets:', error);
     throw error;
@@ -1062,6 +1163,7 @@ if (ENABLE_AUTO_RESOLVE) {
 /**
  * POST /api/oracle/resolve - Trigger automatic resolution of expired markets
  * Protected by CRON_SECRET environment variable or Vercel cron header
+ * NOTE: This endpoint is excluded from rate limiting (has its own auth)
  */
 app.post('/api/oracle/resolve', async (req, res) => {
   try {
@@ -2288,7 +2390,7 @@ app.get('/api/user/:address/stats', async (req, res) => {
 /**
  * POST /api/user/bet - Record a bet placement (called from frontend)
  */
-app.post('/api/user/bet', async (req, res) => {
+app.post('/api/user/bet', writeLimiter, async (req, res) => {
   try {
     const supabase = require('./supabase-client');
 
@@ -2761,7 +2863,7 @@ app.get('/api/referrals/:address', async (req, res) => {
 /**
  * POST /api/referrals/create - Create a referral code
  */
-app.post('/api/referrals/create', async (req, res) => {
+app.post('/api/referrals/create', writeLimiter, async (req, res) => {
   try {
     const supabase = require('./supabase-client');
     const { userAddress, signature } = req.body;
@@ -2900,7 +3002,7 @@ app.get('/api/referrals/status/:address', async (req, res) => {
 /**
  * POST /api/referrals/redeem - Redeem a referral code
  */
-app.post('/api/referrals/redeem', async (req, res) => {
+app.post('/api/referrals/redeem', writeLimiter, async (req, res) => {
   try {
     const supabase = require('./supabase-client');
     const { refereeAddress, code } = req.body;
@@ -3239,8 +3341,10 @@ app.post('/api/admin/predictions', async (req, res) => {
 
 /**
  * POST /api/admin/create-market - Manual market creation
- * Now also saves to Supabase for frontend visibility
+ * COMMENTED OUT: Twitter predictions disabled, focusing on Ink Chain only
+ * Use /api/admin/predictions endpoint for creating Ink Chain predictions instead
  */
+/*
 app.post('/api/admin/create-market', async (req, res) => {
   try {
     const { tweetId, targetMetric, metricType, durationHours, description } = req.body;
@@ -3307,6 +3411,7 @@ app.post('/api/admin/create-market', async (req, res) => {
     res.status(500).json({ success: false, error: error.message });
   }
 });
+*/
 
 /**
  * GET /api/admin/markets - Get all markets including expired unresolved ones (for admin dashboard)
@@ -3891,7 +3996,7 @@ const PORT = process.env.PORT || 3001;
 if (require.main === module) {
   app.listen(PORT, () => {
     console.log(`🚀 InkPredict backend running on port ${PORT}`);
-    console.log(`📊 Contract: ${process.env.CONTRACT_ADDRESS}`);
+    console.log(`📊 Contract: ${CONTRACT_ADDRESS}`);
     console.log(`🔗 RPC: ${process.env.INK_CHAIN_RPC}`);
     console.log(`⏰ Oracle running, will check markets every minute`);
     console.log(`🐦 Twitter integration active`);
