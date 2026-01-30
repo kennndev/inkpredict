@@ -833,32 +833,46 @@ async function resolveExpiredMarkets() {
       return { resolved: 0, errors: [] };
     }
 
+    // Filter to only markets with bets BEFORE limiting
+    // This prevents empty markets from blocking real ones
+    console.log('🔍 Filtering markets with bets...');
+    const marketsWithBets = [];
+    for (const marketId of expiredMarketIds) {
+      try {
+        const market = await contract.markets(marketId);
+        const totalPool = market.yesPool.add(market.noPool);
+        if (!totalPool.isZero()) {
+          marketsWithBets.push({ marketId, market, totalPool });
+        }
+      } catch (err) {
+        console.log(`⚠️ Error checking market ${marketId}: ${err.message}`);
+      }
+    }
+
+    console.log(`Found ${marketsWithBets.length} expired markets WITH bets (out of ${expiredMarketIds.length} total)`);
+
+    if (marketsWithBets.length === 0) {
+      console.log('✅ No expired markets with bets to resolve');
+      return { resolved: 0, errors: [] };
+    }
+
     // For free cron services with 30s timeout, limit to 3 markets per run
-    // This ensures we complete within the timeout
     const MAX_MARKETS_PER_RUN = 3;
-    const marketsToProcess = expiredMarketIds.slice(0, MAX_MARKETS_PER_RUN);
-    
-    if (expiredMarketIds.length > MAX_MARKETS_PER_RUN) {
-      console.log(`⚠️ Limiting to ${MAX_MARKETS_PER_RUN} markets per run (${expiredMarketIds.length} total expired)`);
-      console.log(`   Remaining ${expiredMarketIds.length - MAX_MARKETS_PER_RUN} will be processed in next run`);
+    const marketsToProcess = marketsWithBets.slice(0, MAX_MARKETS_PER_RUN);
+
+    if (marketsWithBets.length > MAX_MARKETS_PER_RUN) {
+      console.log(`⚠️ Limiting to ${MAX_MARKETS_PER_RUN} markets per run (${marketsWithBets.length} with bets)`);
+      console.log(`   Remaining ${marketsWithBets.length - MAX_MARKETS_PER_RUN} will be processed in next run`);
     }
 
     let resolvedCount = 0;
     const errors = [];
 
-    for (const marketId of marketsToProcess) {
+    for (const { marketId, market, totalPool } of marketsToProcess) {
       try {
-        const market = await contract.markets(marketId);
         const tweetId = market.tweetId;
         const targetMetric = market.targetMetric.toNumber();
         const metricType = market.metricType;
-        const totalPool = market.yesPool.add(market.noPool);
-
-        // Skip markets with no bets (contract will revert with "No bets placed")
-        if (totalPool.isZero()) {
-          console.log(`⏭️  Skipping Market #${marketId}: No bets placed`);
-          continue;
-        }
 
         console.log(`\n--- Resolving Market #${marketId} ---`);
         console.log(`Tweet ID: ${tweetId}`);
