@@ -277,7 +277,9 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
             console.log(`📅 Using block ${targetBlock} at market deadline`);
           } else {
             // Fallback: use latest block
-        const latestBlock = await provider.getBlock('latest');
+            const latestBlock = await retryWithBackoff(async () => {
+              return await provider.getBlock('latest');
+            }, 3, 2000);
             targetBlock = latestBlock.number;
             console.log(`⚠️ No market info, using latest block ${targetBlock}`);
           }
@@ -820,11 +822,39 @@ async function updateSupabaseAfterResolution(marketId, outcome, actualMetric, ma
 /**
  * Resolve expired markets
  */
+/**
+ * Retry function with exponential backoff for rate limit errors
+ */
+async function retryWithBackoff(fn, maxRetries = 3, baseDelay = 1000) {
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      const isRateLimit = error.message?.includes('429') || 
+                         error.message?.includes('rate limit') ||
+                         error.message?.includes('too many requests') ||
+                         error.code === 'ECONNRESET' ||
+                         error.code === 'ETIMEDOUT';
+      
+      if (isRateLimit && attempt < maxRetries - 1) {
+        const delay = baseDelay * Math.pow(2, attempt);
+        console.warn(`⚠️ Rate limit hit, retrying in ${delay}ms... (attempt ${attempt + 1}/${maxRetries})`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        continue;
+      }
+      throw error;
+    }
+  }
+}
+
 async function resolveExpiredMarkets() {
   console.log('🔮 Checking for expired markets...');
 
   try {
-    const expiredMarketIds = await contract.getUnresolvedExpiredMarkets();
+    // Wrap contract call in retry logic for rate limits
+    const expiredMarketIds = await retryWithBackoff(async () => {
+      return await contract.getUnresolvedExpiredMarkets();
+    });
 
     console.log(`Found ${expiredMarketIds.length} expired markets`);
 
@@ -851,7 +881,10 @@ async function resolveExpiredMarkets() {
       }
 
       try {
-        const market = await contract.markets(marketId);
+        // Wrap contract call in retry logic for rate limits
+        const market = await retryWithBackoff(async () => {
+          return await contract.markets(marketId);
+        });
         const totalPool = market.yesPool.add(market.noPool);
 
         // Skip markets with no bets
@@ -892,7 +925,11 @@ async function resolveExpiredMarkets() {
             createdAt: market.createdAt,
             deadline: market.deadline
           };
-          const inkMetrics = await getInkChainMetrics(metricType, market.inkContractAddress || null, marketInfo);
+          // Wrap in retry logic for rate limits
+          const inkMetrics = await retryWithBackoff(async () => {
+            return await getInkChainMetrics(metricType, market.inkContractAddress || null, marketInfo);
+          }, 3, 2000); // Longer delay for RPC calls
+          
           if (inkMetrics && inkMetrics.value !== undefined) {
             actualMetric = typeof inkMetrics.value === 'number' ? inkMetrics.value : parseInt(inkMetrics.value);
           } else {
@@ -947,12 +984,16 @@ async function resolveExpiredMarkets() {
           continue;
         }
 
-        // Resolve on-chain
+        // Resolve on-chain with retry logic
         console.log('⛓️ Submitting resolution to blockchain...');
-        const tx = await oracleContract.resolve(marketId, outcome, actualMetric);
+        const tx = await retryWithBackoff(async () => {
+          return await oracleContract.resolve(marketId, outcome, actualMetric);
+        }, 3, 2000);
         console.log(`TX Hash: ${tx.hash}`);
 
-        const receipt = await tx.wait();
+        const receipt = await retryWithBackoff(async () => {
+          return await tx.wait();
+        }, 3, 2000);
         console.log(`✅ Market ${marketId} resolved! Gas Used: ${receipt.gasUsed.toString()}`);
 
         // Update Supabase
@@ -964,12 +1005,34 @@ async function resolveExpiredMarkets() {
 
         resolvedCount++;
 
-        // Reduced delay for faster processing (was 2000ms, now 500ms)
-        // This helps stay within 30s timeout for free cron services
-        await new Promise(resolve => setTimeout(resolve, 500));
+        // Delay between markets to avoid rate limits
+        // Increased to 2 seconds to give RPC time to recover
+        await new Promise(resolve => setTimeout(resolve, 2000));
       } catch (error) {
-        console.error(`❌ Error resolving market ${marketId}:`, error.message);
-        errors.push({ marketId, error: error.message });
+        const errorMsg = error.message || error.toString();
+        console.error(`❌ Error resolving market ${marketId}:`, errorMsg);
+        
+        // Check if it's a rate limit error
+        const isRateLimit = errorMsg.includes('429') || 
+                           errorMsg.includes('rate limit') ||
+                           errorMsg.includes('too many requests') ||
+                           error.code === 'ECONNRESET' ||
+                           error.code === 'ETIMEDOUT';
+        
+        if (isRateLimit) {
+          console.warn(`⚠️ Rate limit error for market ${marketId}, will retry in next run`);
+        }
+        
+        errors.push({ 
+          marketId, 
+          error: errorMsg,
+          isRateLimit 
+        });
+        
+        // Add extra delay after rate limit errors
+        if (isRateLimit) {
+          await new Promise(resolve => setTimeout(resolve, 5000));
+        }
       }
     }
 
