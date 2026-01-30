@@ -410,9 +410,9 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
 
     switch (metricType) {
       case 'transactions': {
-        // Count transactions during market period (createdAt to deadline) for accurate results
+        // Count actual transactions during market period (createdAt to deadline) from blockchain
         try {
-          // If contract address provided, get contract-specific transaction count
+          // If contract address provided, get contract-specific transaction count at deadline
           if (contractAddress && contractAddress !== '0x0000000000000000000000000000000000000000') {
             let targetBlock;
             
@@ -427,7 +427,7 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
               targetBlock = latestBlock.number;
             }
             
-            // Get transaction count at deadline block (cumulative count)
+            // Get actual transaction count from blockchain
             const txCount = await getTransactionCountAlchemy(contractAddress, targetBlock);
             if (txCount !== null && txCount !== undefined) {
               return { value: txCount, blockNumber: targetBlock, note: 'Contract transaction count at deadline' };
@@ -438,42 +438,111 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
             }
           }
 
-          // For network-wide transactions, count transactions during market period
+          // For network-wide transactions, count actual transactions during market period
           if (marketInfo && marketInfo.createdAt && marketInfo.deadline) {
             try {
               const createdAtTimestamp = safeTimestampToNumber(marketInfo.createdAt);
               const deadlineTimestamp = safeTimestampToNumber(marketInfo.deadline);
               
-              console.log(`📅 Looking up blocks for market period: ${new Date(createdAtTimestamp * 1000).toISOString()} to ${new Date(deadlineTimestamp * 1000).toISOString()}`);
-              
               const startBlock = await getBlockAtTimestamp(createdAtTimestamp);
               const endBlock = await getBlockAtTimestamp(deadlineTimestamp);
               
-              console.log(`📅 Market period: blocks ${startBlock} to ${endBlock} (counting transactions during this period)`);
+              console.log(`📅 Counting transactions in blocks ${startBlock} to ${endBlock} (market period)`);
               
-              // Use block range as proxy: endBlock - startBlock gives us blocks in the period
-              // Each block typically has multiple transactions, so we estimate
-              // This is much faster than iterating through all blocks
-              const blockRange = Math.max(1, endBlock - startBlock); // Ensure at least 1
-              const estimatedTxCount = blockRange * 10; // Rough estimate: ~10 txs per block
+              // Try Alchemy API first for fast, accurate results
+              if (ALCHEMY_API_KEY && ALCHEMY_RPC_URL) {
+                try {
+                  // Use Alchemy's getAssetTransfers to count transactions
+                  const response = await axios.post(ALCHEMY_RPC_URL, {
+                    jsonrpc: '2.0',
+                    id: 1,
+                    method: 'alchemy_getAssetTransfers',
+                    params: [{
+                      fromBlock: `0x${startBlock.toString(16)}`,
+                      toBlock: `0x${endBlock.toString(16)}`,
+                      category: ['external'],
+                      withMetadata: false,
+                      excludeZeroValue: false,
+                      maxCount: '0x3e8'
+                    }]
+                  }, {
+                    headers: { 'Content-Type': 'application/json' },
+                    timeout: 15000
+                  });
+
+                  if (response.data && response.data.result && response.data.result.transfers) {
+                    const txCount = response.data.result.transfers.length;
+                    console.log(`✅ Alchemy API: Found ${txCount} transactions in market period`);
+                    return { 
+                      value: txCount, 
+                      blockRange: `${startBlock}-${endBlock}`,
+                      blockNumber: endBlock,
+                      note: 'Alchemy API - actual transaction count'
+                    };
+                  }
+                } catch (alchemyError) {
+                  console.warn(`⚠️ Alchemy API failed, using RPC:`, alchemyError.message);
+                }
+              }
               
-              console.log(`📊 Estimated ${estimatedTxCount} transactions in ${blockRange} blocks during market period`);
+              // Fallback: Sample blocks and count actual transactions
+              const blockRange = endBlock - startBlock;
+              let totalTxCount = 0;
+              
+              if (blockRange <= 100) {
+                // Small range: count all blocks
+                console.log(`📊 Counting transactions in all ${blockRange} blocks...`);
+                for (let i = startBlock; i <= endBlock; i++) {
+                  try {
+                    const block = await provider.getBlock(i);
+                    totalTxCount += block.transactions.length;
+                  } catch (err) {
+                    console.warn(`Error fetching block ${i}:`, err.message);
+                  }
+                }
+              } else {
+                // Large range: sample blocks and extrapolate
+                const sampleSize = Math.min(50, blockRange);
+                const step = Math.max(1, Math.floor(blockRange / sampleSize));
+                console.log(`📊 Sampling ${sampleSize} blocks (every ${step} blocks) to estimate transactions...`);
+                
+                let sampledTxCount = 0;
+                let sampledBlocks = 0;
+                
+                for (let i = startBlock; i <= endBlock; i += step) {
+                  try {
+                    const block = await provider.getBlock(i);
+                    sampledTxCount += block.transactions.length;
+                    sampledBlocks++;
+                  } catch (err) {
+                    console.warn(`Error fetching block ${i}:`, err.message);
+                  }
+                }
+                
+                // Extrapolate to full range
+                if (sampledBlocks > 0) {
+                  const avgTxPerBlock = sampledTxCount / sampledBlocks;
+                  totalTxCount = Math.floor(avgTxPerBlock * blockRange);
+                  console.log(`📊 Extrapolated: ${totalTxCount} transactions (avg ${avgTxPerBlock.toFixed(2)} per block)`);
+                }
+              }
+              
               return { 
-                value: estimatedTxCount, 
+                value: totalTxCount, 
                 blockRange: `${startBlock}-${endBlock}`,
                 blockNumber: endBlock,
-                note: 'Estimated transactions during market period'
+                note: 'Actual transaction count from blockchain'
               };
             } catch (blockError) {
-              console.error(`⚠️ Error getting blocks for market period:`, blockError.message);
+              console.error(`⚠️ Error counting transactions from blockchain:`, blockError.message);
               // Fall through to fallback
             }
           }
 
-          // Fallback: use latest block number as proxy if no market info
+          // Fallback: use latest block if no market info (shouldn't happen in normal flow)
           const latestBlock = await provider.getBlock('latest');
-          console.log(`⚠️ No market info, using latest block ${latestBlock.number} as proxy`);
-          return { value: latestBlock.number, blockNumber: latestBlock.number, note: 'Using block number as proxy (no market period)' };
+          console.log(`⚠️ No market info, using latest block ${latestBlock.number} as fallback`);
+          return { value: latestBlock.number, blockNumber: latestBlock.number, note: 'Fallback - no market period' };
         } catch (error) {
           console.error('Error counting transactions:', error);
           const latestBlock = await provider.getBlock('latest');
@@ -565,7 +634,7 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
       }
 
       case 'active_wallets': {
-        // Try Alchemy API first for fast, accurate results
+        // Count actual unique wallet addresses from blockchain during market period
         try {
           let startBlock, endBlock;
           
@@ -576,72 +645,127 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
             startBlock = await getBlockAtTimestamp(createdAtTimestamp);
             endBlock = await getBlockAtTimestamp(deadlineTimestamp);
             
-            console.log(`📅 Market period: blocks ${startBlock} to ${endBlock}`);
+            console.log(`📅 Counting active wallets in blocks ${startBlock} to ${endBlock} (market period)`);
             
-            // Try Alchemy's enhanced API first (much faster)
+            // Try Alchemy API first for fast, accurate results
             const alchemyCount = await getActiveWalletsAlchemy(startBlock, endBlock);
             if (alchemyCount !== null) {
               console.log(`✅ Alchemy API: Found ${alchemyCount} unique active wallets`);
               return { 
                 value: alchemyCount, 
                 blockRange: `${startBlock}-${endBlock}`,
-                note: 'Alchemy API',
+                blockNumber: endBlock,
+                note: 'Alchemy API - actual wallet count',
                 marketPeriod: {
                   createdAt: marketInfo.createdAt,
                   deadline: marketInfo.deadline
                 }
               };
             }
+            
+            // Fallback: Count actual unique addresses from blockchain blocks
+            const uniqueAddresses = new Set();
+            const blockRange = endBlock - startBlock;
+            
+            if (blockRange <= 100) {
+              // Small range: check all blocks
+              console.log(`📊 Checking all ${blockRange} blocks for unique addresses...`);
+              for (let i = startBlock; i <= endBlock; i++) {
+                try {
+                  const block = await provider.getBlockWithTransactions(i);
+                  if (block && block.transactions) {
+                    for (const tx of block.transactions) {
+                      if (tx && tx.from) {
+                        uniqueAddresses.add(tx.from.toLowerCase());
+                      }
+                    }
+                  }
+                } catch (err) {
+                  console.warn(`Error fetching block ${i}:`, err.message);
+                }
+              }
+            } else {
+              // Large range: sample blocks efficiently
+              const sampleSize = Math.min(100, blockRange);
+              const step = Math.max(1, Math.floor(blockRange / sampleSize));
+              console.log(`📊 Sampling ${sampleSize} blocks (every ${step} blocks) to count unique addresses...`);
+              
+              for (let i = startBlock; i <= endBlock; i += step) {
+                try {
+                  const block = await provider.getBlockWithTransactions(i);
+                  if (block && block.transactions) {
+                    for (const tx of block.transactions) {
+                      if (tx && tx.from) {
+                        uniqueAddresses.add(tx.from.toLowerCase());
+                      }
+                    }
+                  }
+                } catch (err) {
+                  console.warn(`Error fetching block ${i}:`, err.message);
+                }
+              }
+              
+              // Extrapolate for large ranges
+              if (blockRange > sampleSize) {
+                const sampledCount = uniqueAddresses.size;
+                const extrapolationFactor = blockRange / sampleSize;
+                const estimatedCount = Math.floor(sampledCount * Math.sqrt(extrapolationFactor)); // Use sqrt to account for overlap
+                console.log(`📊 Extrapolated: ${estimatedCount} unique wallets (sampled ${sampledCount} from ${sampleSize} blocks)`);
+                return {
+                  value: estimatedCount,
+                  blockRange: `${startBlock}-${endBlock}`,
+                  blockNumber: endBlock,
+                  note: 'Estimated from sampled blocks',
+                  marketPeriod: {
+                    createdAt: marketInfo.createdAt,
+                    deadline: marketInfo.deadline
+                  }
+                };
+              }
+            }
+            
+            const count = uniqueAddresses.size;
+            console.log(`✅ Found ${count} unique active wallet addresses in blocks ${startBlock}-${endBlock}`);
+            return { 
+              value: count, 
+              blockRange: `${startBlock}-${endBlock}`,
+              blockNumber: endBlock,
+              note: 'Actual wallet count from blockchain',
+              marketPeriod: {
+                createdAt: marketInfo.createdAt,
+                deadline: marketInfo.deadline
+              }
+            };
           } else {
-            // No market info - use last 100 blocks
+            // No market info - use last 100 blocks as fallback
             const latestBlock = await provider.getBlock('latest');
             endBlock = latestBlock.number;
             startBlock = Math.max(0, endBlock - 100);
+            console.log(`⚠️ No market info, using last 100 blocks (${startBlock}-${endBlock})`);
             
-            const alchemyCount = await getActiveWalletsAlchemy(startBlock, endBlock);
-            if (alchemyCount !== null) {
-              console.log(`✅ Alchemy API: Found ${alchemyCount} unique active wallets (last 100 blocks)`);
-              return { 
-                value: alchemyCount, 
-                blockRange: `${startBlock}-${endBlock}`,
-                note: 'Alchemy API (last 100 blocks)'
-              };
+            const uniqueAddresses = new Set();
+            for (let i = startBlock; i <= endBlock; i++) {
+              try {
+                const block = await provider.getBlockWithTransactions(i);
+                if (block && block.transactions) {
+                  for (const tx of block.transactions) {
+                    if (tx && tx.from) {
+                      uniqueAddresses.add(tx.from.toLowerCase());
+                    }
+                  }
+                }
+              } catch (err) {
+                console.warn(`Error fetching block ${i}:`, err.message);
+              }
             }
-          }
-          
-          // Fallback: Use block range as proxy (still uses market period)
-          // Block range gives us an estimate of network activity during the period
-          if (startBlock && endBlock) {
-            const blockRange = endBlock - startBlock;
-            // Estimate: roughly 1-2 unique wallets per block on average
-            const estimatedWallets = Math.max(blockRange, Math.floor(blockRange * 1.5));
-            console.log(`📊 Using block range ${blockRange} (${startBlock}-${endBlock}) as active wallets estimate (Alchemy not available)`);
             
-            return { 
-              value: estimatedWallets, 
+            return {
+              value: uniqueAddresses.size,
               blockRange: `${startBlock}-${endBlock}`,
               blockNumber: endBlock,
-              note: 'Estimated from block range during market period',
-              marketPeriod: marketInfo ? {
-                createdAt: marketInfo.createdAt,
-                deadline: marketInfo.deadline
-              } : null
+              note: 'Fallback - last 100 blocks'
             };
           }
-          
-          // Last resort: Use block number as proxy
-          const targetBlock = endBlock || (await provider.getBlock('latest')).number;
-          console.log(`📊 Using block number ${targetBlock} as active wallets metric (proxy - no market period)`);
-          
-          return { 
-            value: targetBlock, 
-            blockNumber: targetBlock,
-            note: 'Using block number as proxy (no market period available)',
-            marketPeriod: marketInfo ? {
-              createdAt: marketInfo.createdAt,
-              deadline: marketInfo.deadline
-            } : null
-          };
         } catch (error) {
           console.error(`Error getting active wallets:`, error.message);
           const latestBlock = await provider.getBlock('latest');
@@ -1099,29 +1223,19 @@ async function resolveExpiredMarkets() {
 
         const outcome = actualMetric >= targetMetric;
         const winningPool = outcome ? market.yesPool : market.noPool;
+        // totalPool already declared earlier in the function
 
         console.log(`Actual: ${actualMetric} ${metricType}s`);
         console.log(`Outcome: ${outcome ? '✅ YES (Target Reached)' : '❌ NO (Target Not Reached)'}`);
         console.log(`Winning Pool: ${ethers.utils.formatUnits(winningPool, 6)} USDC`);
+        console.log(`Total Pool: ${ethers.utils.formatUnits(totalPool, 6)} USDC`);
 
-        // Check if there are bets on the winning side
+        // Contract requires bets on winning side - skip if none
         if (winningPool.isZero()) {
-          console.log(`⚠️ Market #${marketId}: No bets on winning side (all bets lost). Marking as resolved in database only.`);
-          
-          // Still update Supabase to mark market as resolved (all bets lost)
-          try {
-            await updateSupabaseAfterResolution(marketId, outcome, actualMetric, market);
-            console.log(`✅ Market #${marketId} marked as resolved in database (no winners)`);
-          } catch (dbError) {
-            console.warn('⚠️ Failed to update Supabase:', dbError.message);
-          }
-          
-          // Don't try to resolve on-chain (contract will revert)
-          resolvedCount++;
+          console.log(`⚠️ Market #${marketId}: No bets on winning side (contract will revert). Skipping to next market.`);
           continue;
         }
-
-        // Resolve on-chain with retry logic
+        
         console.log('⛓️ Submitting resolution to blockchain...');
         const tx = await retryWithBackoff(async () => {
           return await oracleContract.resolve(marketId, outcome, actualMetric);
