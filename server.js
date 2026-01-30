@@ -907,6 +907,45 @@ async function marketExists(tweetId) {
 // ============ Market Resolution (Automated) ============
 
 /**
+ * Calculate win/loss streaks from user's bet history
+ * Returns { currentStreak, longestStreak }
+ */
+function calculateStreaks(bets) {
+  // Get only resolved bets (won = true or false, not null)
+  const resolvedBets = bets
+    .filter(b => b.won !== null && b.won !== undefined)
+    .sort((a, b) => new Date(a.created_at) - new Date(b.created_at)); // Chronological order
+
+  if (resolvedBets.length === 0) {
+    return { currentStreak: 0, longestStreak: 0 };
+  }
+
+  // Calculate current streak (consecutive wins from most recent)
+  let currentStreak = 0;
+  for (let i = resolvedBets.length - 1; i >= 0; i--) {
+    if (resolvedBets[i].won === true) {
+      currentStreak++;
+    } else {
+      break; // Streak broken by a loss
+    }
+  }
+
+  // Calculate longest streak (longest consecutive wins in history)
+  let longestStreak = 0;
+  let tempStreak = 0;
+  for (const bet of resolvedBets) {
+    if (bet.won === true) {
+      tempStreak++;
+      longestStreak = Math.max(longestStreak, tempStreak);
+    } else {
+      tempStreak = 0;
+    }
+  }
+
+  return { currentStreak, longestStreak };
+}
+
+/**
  * Update Supabase database after market resolution
  * This function updates predictions, user_bets, and user_stats tables
  */
@@ -983,6 +1022,9 @@ async function updateSupabaseAfterResolution(marketId, outcome, actualMetric, ma
           const winRate = resolvedBets > 0 ? (totalWins / resolvedBets) * 100 : 0;
           const lastBetAt = userBets.length > 0 ? userBets[userBets.length - 1].created_at : null;
 
+          // Calculate win/loss streaks
+          const { currentStreak, longestStreak } = calculateStreaks(userBets);
+
           await supabase
             .from('user_stats')
             .upsert({
@@ -993,6 +1035,8 @@ async function updateSupabaseAfterResolution(marketId, outcome, actualMetric, ma
               total_volume: totalVolume,
               total_winnings: totalWinnings,
               win_rate: winRate,
+              current_streak: currentStreak,
+              longest_streak: longestStreak,
               last_bet_at: lastBetAt,
               updated_at: new Date().toISOString()
             }, { onConflict: 'user_address' });
@@ -1003,7 +1047,9 @@ async function updateSupabaseAfterResolution(marketId, outcome, actualMetric, ma
               total_bets: totalBets,
               total_wins: totalWins,
               total_losses: totalLosses,
-              win_rate: winRate
+              win_rate: winRate,
+              current_streak: currentStreak,
+              longest_streak: longestStreak
             });
           } catch (achievementError) {
             console.error(`Error checking achievements for ${userAddress}:`, achievementError);
@@ -1899,19 +1945,25 @@ async function checkAndAwardAchievements(supabase, userAddress, stats) {
     bet_50: { threshold: 50, xp: 250, check: () => stats.total_bets >= 50 },
     bet_100: { threshold: 100, xp: 500, check: () => stats.total_bets >= 100 },
     bet_500: { threshold: 500, xp: 1000, check: () => stats.total_bets >= 500 },
-    
+
     // Winning achievements
     first_win: { threshold: 1, xp: 75, check: () => stats.total_wins >= 1 },
     win_10: { threshold: 10, xp: 200, check: () => stats.total_wins >= 10 },
     win_50: { threshold: 50, xp: 500, check: () => stats.total_wins >= 50 },
-    win_rate_60: { 
-      threshold: 0.6, 
-      xp: 300, 
+    win_rate_60: {
+      threshold: 0.6,
+      xp: 300,
       check: () => {
         const resolvedBets = stats.total_wins + stats.total_losses;
         return resolvedBets >= 20 && stats.win_rate >= 60;
       }
-    }
+    },
+
+    // Streak achievements
+    streak_3: { threshold: 3, xp: 150, check: () => (stats.current_streak || 0) >= 3 },
+    streak_5: { threshold: 5, xp: 300, check: () => (stats.current_streak || 0) >= 5 },
+    streak_10: { threshold: 10, xp: 750, check: () => (stats.current_streak || 0) >= 10 },
+    streak_20: { threshold: 20, xp: 2000, check: () => (stats.longest_streak || 0) >= 20 }
   };
 
   // Check each achievement
