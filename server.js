@@ -229,13 +229,13 @@ async function getBlockAtTimestamp(targetTimestamp, maxIterations = 50) {
       iterations++;
       const mid = Math.floor((low + high) / 2);
       
-      // Check cache first
-      let block;
-      if (blockTimestampCache.has(mid)) {
-        block = blockTimestampCache.get(mid);
-      } else {
-        try {we
-          block = await provider.getBlock(mid);
+        // Check cache first
+        let block;
+        if (blockTimestampCache.has(mid)) {
+          block = blockTimestampCache.get(mid);
+        } else {
+          try {
+            block = await provider.getBlock(mid);
           // Cache recent blocks (within last 1000 blocks)
           if (mid > latestBlock.number - 1000) {
             blockTimestampCache.set(mid, block);
@@ -429,32 +429,45 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
             
             // Get transaction count at deadline block (cumulative count)
             const txCount = await getTransactionCountAlchemy(contractAddress, targetBlock);
-            return { value: txCount, blockNumber: targetBlock, note: 'Contract transaction count at deadline' };
+            if (txCount !== null && txCount !== undefined) {
+              return { value: txCount, blockNumber: targetBlock, note: 'Contract transaction count at deadline' };
+            } else {
+              // Fallback to standard RPC if Alchemy fails
+              const txCountRpc = await provider.getTransactionCount(contractAddress, targetBlock);
+              return { value: txCountRpc, blockNumber: targetBlock, note: 'Contract transaction count at deadline (RPC fallback)' };
+            }
           }
 
           // For network-wide transactions, count transactions during market period
           if (marketInfo && marketInfo.createdAt && marketInfo.deadline) {
-            const createdAtTimestamp = safeTimestampToNumber(marketInfo.createdAt);
-            const deadlineTimestamp = safeTimestampToNumber(marketInfo.deadline);
-            
-            const startBlock = await getBlockAtTimestamp(createdAtTimestamp);
-            const endBlock = await getBlockAtTimestamp(deadlineTimestamp);
-            
-            console.log(`📅 Market period: blocks ${startBlock} to ${endBlock} (counting transactions during this period)`);
-            
-            // Use block range as proxy: endBlock - startBlock gives us blocks in the period
-            // Each block typically has multiple transactions, so we estimate
-            // This is much faster than iterating through all blocks
-            const blockRange = endBlock - startBlock;
-            const estimatedTxCount = blockRange * 10; // Rough estimate: ~10 txs per block
-            
-            console.log(`📊 Estimated ${estimatedTxCount} transactions in ${blockRange} blocks during market period`);
-            return { 
-              value: estimatedTxCount, 
-              blockRange: `${startBlock}-${endBlock}`,
-              blockNumber: endBlock,
-              note: 'Estimated transactions during market period'
-            };
+            try {
+              const createdAtTimestamp = safeTimestampToNumber(marketInfo.createdAt);
+              const deadlineTimestamp = safeTimestampToNumber(marketInfo.deadline);
+              
+              console.log(`📅 Looking up blocks for market period: ${new Date(createdAtTimestamp * 1000).toISOString()} to ${new Date(deadlineTimestamp * 1000).toISOString()}`);
+              
+              const startBlock = await getBlockAtTimestamp(createdAtTimestamp);
+              const endBlock = await getBlockAtTimestamp(deadlineTimestamp);
+              
+              console.log(`📅 Market period: blocks ${startBlock} to ${endBlock} (counting transactions during this period)`);
+              
+              // Use block range as proxy: endBlock - startBlock gives us blocks in the period
+              // Each block typically has multiple transactions, so we estimate
+              // This is much faster than iterating through all blocks
+              const blockRange = Math.max(1, endBlock - startBlock); // Ensure at least 1
+              const estimatedTxCount = blockRange * 10; // Rough estimate: ~10 txs per block
+              
+              console.log(`📊 Estimated ${estimatedTxCount} transactions in ${blockRange} blocks during market period`);
+              return { 
+                value: estimatedTxCount, 
+                blockRange: `${startBlock}-${endBlock}`,
+                blockNumber: endBlock,
+                note: 'Estimated transactions during market period'
+              };
+            } catch (blockError) {
+              console.error(`⚠️ Error getting blocks for market period:`, blockError.message);
+              // Fall through to fallback
+            }
           }
 
           // Fallback: use latest block number as proxy if no market info
@@ -1033,15 +1046,29 @@ async function resolveExpiredMarkets() {
             deadline: market.deadline.toString()
           };
           // Wrap in retry logic for rate limits
-          const inkMetrics = await retryWithBackoff(async () => {
-            return await getInkChainMetrics(metricType, market.inkContractAddress || null, marketInfo);
-          }, 3, 2000); // Longer delay for RPC calls
+          let inkMetrics;
+          try {
+            inkMetrics = await retryWithBackoff(async () => {
+              return await getInkChainMetrics(metricType, market.inkContractAddress || null, marketInfo);
+            }, 3, 2000); // Longer delay for RPC calls
+          } catch (metricError) {
+            console.error(`❌ Error fetching metrics for market ${marketId}:`, metricError.message);
+            errors.push({ 
+              marketId: marketId.toString(), 
+              error: `Failed to fetch Ink Chain metrics: ${metricError.message}` 
+            });
+            continue;
+          }
           
           if (inkMetrics && inkMetrics.value !== undefined) {
             actualMetric = typeof inkMetrics.value === 'number' ? inkMetrics.value : parseInt(inkMetrics.value);
+            console.log(`✅ Fetched metric value: ${actualMetric}`);
           } else {
-            console.error(`Failed to fetch Ink Chain metrics for market ${marketId}`);
-            errors.push({ marketId, error: 'Failed to fetch Ink Chain metrics' });
+            console.error(`❌ Failed to fetch Ink Chain metrics for market ${marketId} - returned:`, inkMetrics);
+            errors.push({ 
+              marketId: marketId.toString(), 
+              error: 'Failed to fetch Ink Chain metrics - returned null or undefined' 
+            });
             continue;
           }
         } else {
