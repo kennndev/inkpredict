@@ -1081,6 +1081,66 @@ app.get('/api/oracle/resolve', async (req, res) => {
 });
 
 /**
+ * GET /api/debug/resolution - Debug endpoint to check market resolution status
+ */
+app.get('/api/debug/resolution', async (req, res) => {
+  try {
+    const now = Math.floor(Date.now() / 1000);
+
+    // Get market count from contract
+    const marketCount = await contract.marketCount();
+    console.log(`Total markets in contract: ${marketCount.toString()}`);
+
+    // Get expired markets from contract
+    const expiredMarketIds = await contract.getUnresolvedExpiredMarkets();
+    console.log(`Expired markets returned: ${expiredMarketIds.map(id => id.toString())}`);
+
+    // Check specific markets (79-85)
+    const marketsToCheck = [79, 80, 81, 82, 83, 85];
+    const marketDetails = [];
+
+    for (const id of marketsToCheck) {
+      try {
+        if (id < marketCount.toNumber()) {
+          const market = await contract.markets(id);
+          const deadline = market.deadline.toNumber();
+          const isExpired = deadline < now;
+          const totalPool = market.yesPool.add(market.noPool);
+
+          marketDetails.push({
+            id,
+            deadline,
+            deadlineDate: new Date(deadline * 1000).toISOString(),
+            isExpired,
+            resolved: market.resolved,
+            yesPool: ethers.utils.formatUnits(market.yesPool, 6),
+            noPool: ethers.utils.formatUnits(market.noPool, 6),
+            totalPool: ethers.utils.formatUnits(totalPool, 6),
+            hasBets: !totalPool.isZero()
+          });
+        } else {
+          marketDetails.push({ id, error: 'Market ID exceeds marketCount' });
+        }
+      } catch (err) {
+        marketDetails.push({ id, error: err.message });
+      }
+    }
+
+    res.json({
+      success: true,
+      currentTime: now,
+      currentTimeISO: new Date(now * 1000).toISOString(),
+      marketCount: marketCount.toString(),
+      expiredMarketsFromContract: expiredMarketIds.map(id => id.toString()),
+      checkedMarkets: marketDetails
+    });
+  } catch (error) {
+    console.error('Debug resolution error:', error);
+    res.status(500).json({ success: false, error: error.message });
+  }
+});
+
+/**
  * POST /api/cron-create-prediction - Auto-create Ink Chain predictions from templates
  * Protected by ADMIN_API_SECRET
  */
