@@ -54,24 +54,50 @@ app.use((req, res, next) => {
 const twitterClient = new TwitterApi(process.env.TWITTER_BEARER_TOKEN);
 
 // Blockchain connection - Use Alchemy if available, otherwise use standard RPC
+// This provider is for contract interactions (Sepolia)
 let provider;
 const ALCHEMY_API_KEY = process.env.ALCHEMY_API_KEY;
 const ALCHEMY_RPC_URL = process.env.ALCHEMY_RPC_URL;
 
+// Separate provider for metrics fetching (can be mainnet)
+// Defaults to Sepolia if INK_CHAIN_MAINNET_RPC is not set
+let metricsProvider;
+const INK_CHAIN_MAINNET_RPC = process.env.INK_CHAIN_MAINNET_RPC;
+const INK_CHAIN_MAINNET_CHAIN_ID = parseInt(process.env.INK_CHAIN_MAINNET_CHAIN_ID || '57073'); // Default Ink Chain mainnet chain ID
+const USE_MAINNET_FOR_METRICS = process.env.USE_MAINNET_FOR_METRICS === 'true';
+
+// Separate Alchemy RPC URL for mainnet (optional - for enhanced Alchemy features on mainnet)
+const ALCHEMY_MAINNET_RPC_URL = process.env.ALCHEMY_MAINNET_RPC_URL;
+
 if (ALCHEMY_API_KEY && ALCHEMY_RPC_URL) {
   // Use Alchemy provider for better performance
+  // Use StaticJsonRpcProvider to avoid network detection issues
   console.log('🔮 Using Alchemy provider for enhanced performance');
-  provider = new ethers.providers.JsonRpcProvider(ALCHEMY_RPC_URL, {
+  provider = new ethers.providers.StaticJsonRpcProvider(ALCHEMY_RPC_URL, {
     chainId: 763373,
     name: 'ink-sepolia'
   });
 } else {
   // Fallback to standard RPC
-  provider = new ethers.providers.JsonRpcProvider(process.env.INK_CHAIN_RPC, {
+  // Use StaticJsonRpcProvider to avoid network detection issues
+  provider = new ethers.providers.StaticJsonRpcProvider(process.env.INK_CHAIN_RPC, {
     chainId: 763373,
     name: 'ink-sepolia'
   });
 }
+
+// Metrics provider - can be mainnet or sepolia
+if (USE_MAINNET_FOR_METRICS && INK_CHAIN_MAINNET_RPC) {
+  console.log('🌐 Using Ink Chain MAINNET for metrics fetching');
+  metricsProvider = new ethers.providers.StaticJsonRpcProvider(INK_CHAIN_MAINNET_RPC, {
+    chainId: INK_CHAIN_MAINNET_CHAIN_ID,
+    name: 'ink-mainnet'
+  });
+} else {
+  console.log('🧪 Using Ink Chain SEPOLIA for metrics fetching');
+  metricsProvider = provider; // Use same provider as contract
+}
+
 const adminWallet = new ethers.Wallet(process.env.ADMIN_PRIVATE_KEY, provider);
 const oracleWallet = new ethers.Wallet(process.env.ORACLE_PRIVATE_KEY, provider);
 
@@ -207,7 +233,7 @@ const blockTimestampCache = new Map(); // Cache block timestamps to avoid repeat
 
 async function getBlockAtTimestamp(targetTimestamp, maxIterations = 50) {
   try {
-    const latestBlock = await provider.getBlock('latest');
+    const latestBlock = await metricsProvider.getBlock('latest');
     
     // If target is in the future or very recent, return latest
     if (targetTimestamp >= latestBlock.timestamp) {
@@ -235,7 +261,7 @@ async function getBlockAtTimestamp(targetTimestamp, maxIterations = 50) {
           block = blockTimestampCache.get(mid);
         } else {
           try {
-            block = await provider.getBlock(mid);
+            block = await metricsProvider.getBlock(mid);
           // Cache recent blocks (within last 1000 blocks)
           if (mid > latestBlock.number - 1000) {
             blockTimestampCache.set(mid, block);
@@ -275,7 +301,7 @@ async function getBlockAtTimestamp(targetTimestamp, maxIterations = 50) {
     console.error('Error finding block at timestamp:', error);
     // Fallback: estimate based on average block time
     try {
-      const latestBlock = await provider.getBlock('latest');
+      const latestBlock = await metricsProvider.getBlock('latest');
       const avgBlockTime = 2; // seconds (approximate for Ink Chain)
       const timeDiff = latestBlock.timestamp - targetTimestamp;
       const blocksAgo = Math.floor(timeDiff / avgBlockTime);
@@ -307,14 +333,20 @@ function safeTimestampToNumber(timestamp) {
 /**
  * Use Alchemy Enhanced API for faster data fetching
  * Falls back to standard RPC if Alchemy is not available
+ * Uses mainnet Alchemy URL if USE_MAINNET_FOR_METRICS is enabled and ALCHEMY_MAINNET_RPC_URL is set
  */
 async function getAlchemyData(method, params = []) {
-  if (!ALCHEMY_API_KEY || !ALCHEMY_RPC_URL) {
+  // Determine which Alchemy URL to use based on whether we're fetching mainnet metrics
+  const alchemyUrl = (USE_MAINNET_FOR_METRICS && ALCHEMY_MAINNET_RPC_URL) 
+    ? ALCHEMY_MAINNET_RPC_URL 
+    : ALCHEMY_RPC_URL;
+  
+  if (!ALCHEMY_API_KEY || !alchemyUrl) {
     return null; // Alchemy not configured
   }
 
   try {
-    const response = await axios.post(ALCHEMY_RPC_URL, {
+    const response = await axios.post(alchemyUrl, {
       jsonrpc: '2.0',
       id: 1,
       method: method,
@@ -351,20 +383,25 @@ async function getTransactionCountAlchemy(contractAddress, blockNumber) {
   }
 
   // Fallback to standard RPC
-  return await provider.getTransactionCount(contractAddress, blockNumber);
+  return await metricsProvider.getTransactionCount(contractAddress, blockNumber);
 }
 
 /**
  * Get unique addresses from blocks using Alchemy's getAssetTransfers (much faster than iterating)
  */
 async function getActiveWalletsAlchemy(startBlock, endBlock) {
-  if (!ALCHEMY_API_KEY || !ALCHEMY_RPC_URL) {
+  // Determine which Alchemy URL to use based on whether we're fetching mainnet metrics
+  const alchemyUrl = (USE_MAINNET_FOR_METRICS && ALCHEMY_MAINNET_RPC_URL) 
+    ? ALCHEMY_MAINNET_RPC_URL 
+    : ALCHEMY_RPC_URL;
+  
+  if (!ALCHEMY_API_KEY || !alchemyUrl) {
     return null;
   }
 
   try {
     // Use Alchemy's getAssetTransfers to get unique addresses quickly
-    const response = await axios.post(ALCHEMY_RPC_URL, {
+    const response = await axios.post(alchemyUrl, {
       jsonrpc: '2.0',
       id: 1,
       method: 'alchemy_getAssetTransfers',
@@ -422,7 +459,7 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
               console.log(`📅 Using block ${targetBlock} at market deadline for contract transactions`);
             } else {
               const latestBlock = await retryWithBackoff(async () => {
-                return await provider.getBlock('latest');
+                return await metricsProvider.getBlock('latest');
               }, 3, 2000);
               targetBlock = latestBlock.number;
             }
@@ -433,7 +470,7 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
               return { value: txCount, blockNumber: targetBlock, note: 'Contract transaction count at deadline' };
             } else {
               // Fallback to standard RPC if Alchemy fails
-              const txCountRpc = await provider.getTransactionCount(contractAddress, targetBlock);
+              const txCountRpc = await metricsProvider.getTransactionCount(contractAddress, targetBlock);
               return { value: txCountRpc, blockNumber: targetBlock, note: 'Contract transaction count at deadline (RPC fallback)' };
             }
           }
@@ -450,10 +487,15 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
               console.log(`📅 Counting transactions in blocks ${startBlock} to ${endBlock} (market period)`);
               
               // Try Alchemy API first for fast, accurate results
-              if (ALCHEMY_API_KEY && ALCHEMY_RPC_URL) {
+              // Use mainnet Alchemy URL if available, otherwise fall back to Sepolia Alchemy URL
+              const alchemyUrlForMetrics = (USE_MAINNET_FOR_METRICS && ALCHEMY_MAINNET_RPC_URL) 
+                ? ALCHEMY_MAINNET_RPC_URL 
+                : ALCHEMY_RPC_URL;
+              
+              if (ALCHEMY_API_KEY && alchemyUrlForMetrics) {
                 try {
                   // Use Alchemy's getAssetTransfers to count transactions
-                  const response = await axios.post(ALCHEMY_RPC_URL, {
+                  const response = await axios.post(alchemyUrlForMetrics, {
                     jsonrpc: '2.0',
                     id: 1,
                     method: 'alchemy_getAssetTransfers',
@@ -494,7 +536,7 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
                 console.log(`📊 Counting transactions in all ${blockRange} blocks...`);
                 for (let i = startBlock; i <= endBlock; i++) {
                   try {
-                    const block = await provider.getBlock(i);
+                    const block = await metricsProvider.getBlock(i);
                     totalTxCount += block.transactions.length;
                   } catch (err) {
                     console.warn(`Error fetching block ${i}:`, err.message);
@@ -511,7 +553,7 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
                 
                 for (let i = startBlock; i <= endBlock; i += step) {
                   try {
-                    const block = await provider.getBlock(i);
+                    const block = await metricsProvider.getBlock(i);
                     sampledTxCount += block.transactions.length;
                     sampledBlocks++;
                   } catch (err) {
@@ -540,12 +582,12 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
           }
 
           // Fallback: use latest block if no market info (shouldn't happen in normal flow)
-          const latestBlock = await provider.getBlock('latest');
+          const latestBlock = await metricsProvider.getBlock('latest');
           console.log(`⚠️ No market info, using latest block ${latestBlock.number} as fallback`);
           return { value: latestBlock.number, blockNumber: latestBlock.number, note: 'Fallback - no market period' };
         } catch (error) {
           console.error('Error counting transactions:', error);
-          const latestBlock = await provider.getBlock('latest');
+          const latestBlock = await metricsProvider.getBlock('latest');
           return { value: latestBlock.number, blockNumber: latestBlock.number, note: 'Error fallback' };
         }
       }
@@ -558,17 +600,17 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
           if (marketInfo && marketInfo.deadline) {
             const deadlineTimestamp = safeTimestampToNumber(marketInfo.deadline);
             targetBlock = await getBlockAtTimestamp(deadlineTimestamp);
-            const block = await provider.getBlock(targetBlock);
+            const block = await metricsProvider.getBlock(targetBlock);
             console.log(`📅 Using block ${targetBlock} at market deadline`);
             return { value: targetBlock, timestamp: block.timestamp };
           } else {
             // Fallback: use latest block
-        const latestBlock = await provider.getBlock('latest');
+        const latestBlock = await metricsProvider.getBlock('latest');
         return { value: latestBlock.number, timestamp: latestBlock.timestamp };
           }
         } catch (error) {
           console.error('Error getting block number:', error);
-          const latestBlock = await provider.getBlock('latest');
+          const latestBlock = await metricsProvider.getBlock('latest');
           return { value: latestBlock.number, timestamp: latestBlock.timestamp };
         }
       }
@@ -583,7 +625,7 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
             targetBlock = await getBlockAtTimestamp(deadlineTimestamp);
             console.log(`📅 Using block ${targetBlock} at market deadline for TVL`);
           } else {
-            const latestBlock = await provider.getBlock('latest');
+            const latestBlock = await metricsProvider.getBlock('latest');
             targetBlock = latestBlock.number;
           }
 
@@ -591,7 +633,7 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
         if (contractAddress) {
             // Note: getBalance doesn't support block number directly in ethers v5
             // We'll use the balance at the target block by querying at that block
-            const balance = await provider.getBalance(contractAddress, targetBlock);
+            const balance = await metricsProvider.getBalance(contractAddress, targetBlock);
           const ethBalance = parseFloat(ethers.utils.formatEther(balance));
             return { value: Math.floor(ethBalance * 1000), unit: 'ETH', blockNumber: targetBlock };
           }
@@ -612,13 +654,13 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
             targetBlock = await getBlockAtTimestamp(deadlineTimestamp);
             console.log(`📅 Using block ${targetBlock} at market deadline for gas price`);
           } else {
-            const latestBlock = await provider.getBlock('latest');
+            const latestBlock = await metricsProvider.getBlock('latest');
             targetBlock = latestBlock.number;
           }
 
           // Get gas price at target block
-          const block = await provider.getBlock(targetBlock);
-          const gasPrice = block.gasPrice || await provider.getGasPrice();
+          const block = await metricsProvider.getBlock(targetBlock);
+          const gasPrice = block.gasPrice || await metricsProvider.getGasPrice();
           const gwei = parseFloat(ethers.utils.formatUnits(gasPrice, 'gwei'));
           // Ensure we return at least 1 if gas price is very low (not 0)
           const value = Math.max(1, Math.floor(gwei));
@@ -627,7 +669,7 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
         } catch (error) {
           console.error('Error getting gas price:', error);
           // Fallback
-        const gasPrice = await provider.getGasPrice();
+        const gasPrice = await metricsProvider.getGasPrice();
         const gwei = parseFloat(ethers.utils.formatUnits(gasPrice, 'gwei'));
           return { value: Math.max(1, Math.floor(gwei)), unit: 'gwei', note: 'Fallback' };
         }
@@ -672,7 +714,7 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
               console.log(`📊 Checking all ${blockRange} blocks for unique addresses...`);
               for (let i = startBlock; i <= endBlock; i++) {
                 try {
-                  const block = await provider.getBlockWithTransactions(i);
+                  const block = await metricsProvider.getBlockWithTransactions(i);
                   if (block && block.transactions) {
                     for (const tx of block.transactions) {
                       if (tx && tx.from) {
@@ -738,7 +780,7 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
             };
           } else {
             // No market info - use last 100 blocks as fallback
-            const latestBlock = await provider.getBlock('latest');
+            const latestBlock = await metricsProvider.getBlock('latest');
             endBlock = latestBlock.number;
             startBlock = Math.max(0, endBlock - 100);
             console.log(`⚠️ No market info, using last 100 blocks (${startBlock}-${endBlock})`);
@@ -746,7 +788,7 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
             const uniqueAddresses = new Set();
             for (let i = startBlock; i <= endBlock; i++) {
               try {
-                const block = await provider.getBlockWithTransactions(i);
+                const block = await metricsProvider.getBlockWithTransactions(i);
                 if (block && block.transactions) {
                   for (const tx of block.transactions) {
                     if (tx && tx.from) {
@@ -768,7 +810,7 @@ async function getInkChainMetrics(metricType, contractAddress = null, marketInfo
           }
         } catch (error) {
           console.error(`Error getting active wallets:`, error.message);
-          const latestBlock = await provider.getBlock('latest');
+          const latestBlock = await metricsProvider.getBlock('latest');
           return { value: latestBlock.number, blockNumber: latestBlock.number, note: 'Error fallback' };
         }
       }
@@ -4234,8 +4276,13 @@ const PORT = process.env.PORT || 3001;
 if (require.main === module) {
   app.listen(PORT, () => {
     console.log(`🚀 InkPredict backend running on port ${PORT}`);
-    console.log(`📊 Contract: ${CONTRACT_ADDRESS}`);
+    console.log(`📊 Contract: ${process.env.CONTRACT_ADDRESS}`);
     console.log(`🔗 RPC: ${process.env.INK_CHAIN_RPC}`);
+    if (USE_MAINNET_FOR_METRICS) {
+      console.log(`🌐 Metrics: Using MAINNET (${INK_CHAIN_MAINNET_RPC || 'not configured'})`);
+    } else {
+      console.log(`🧪 Metrics: Using SEPOLIA`);
+    }
     console.log(`⏰ Oracle running, will check markets every minute`);
     console.log(`🐦 Twitter integration active`);
   });
