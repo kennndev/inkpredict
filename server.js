@@ -55,8 +55,9 @@ app.use((req, res, next) => {
   apiLimiter(req, res, next);
 });
 
-// Twitter API client
-const twitterClient = new TwitterApi(process.env.TWITTER_BEARER_TOKEN);
+// Twitter API client - DISABLED (not in use, focusing on Ink Chain only)
+// const twitterClient = new TwitterApi(process.env.TWITTER_BEARER_TOKEN);
+const twitterClient = null; // Disabled to save API costs
 
 // Blockchain connection - Use Alchemy if available, otherwise use standard RPC
 // This provider is for contract interactions (Sepolia)
@@ -181,6 +182,18 @@ async function fetchRecentTweets(userId) {
  * Get tweet metrics (with caching)
  */
 async function getTweetMetrics(tweetId) {
+  // ⚠️ TWITTER DISABLED - Skipping all Twitter API calls to save costs
+  console.log(`⚠️ Twitter integration disabled - returning empty metrics for ${tweetId}`);
+  return {
+    likes: 0,
+    retweets: 0,
+    replies: 0,
+    bookmarks: 0,
+    views: 0,
+    authorId: 'disabled'
+  };
+
+  /* COMMENTED OUT - Twitter functionality disabled to save API costs
   // Skip Twitter fetching for Ink Chain predictions
   if (tweetId.startsWith('ink_')) {
     console.log(`⛓️ Ink Chain prediction detected (${tweetId}), skipping Twitter metrics`);
@@ -253,6 +266,8 @@ async function getTweetMetrics(tweetId) {
     // Return null - let the caller handle it
     return null;
   }
+  */
+  // END COMMENTED OUT Twitter code
 }
 
 /**
@@ -4451,7 +4466,7 @@ if (require.main === module) {
       console.log(`🧪 Metrics: Using SEPOLIA`);
     }
     console.log(`⏰ Oracle running, will check markets every minute`);
-    console.log(`🐦 Twitter integration active`);
+    console.log(`⚠️ Twitter integration DISABLED (focusing on Ink Chain only)`);
   });
 }
 
