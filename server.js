@@ -20,11 +20,14 @@ app.use(cors());
 // Enable trust proxy for Vercel/proxies
 app.set('trust proxy', 1);
 
-// Rate limiting - Different limits for different endpoint types
+// Rate limiting - Different limits for different endpoint types (configurable)
+const API_RATE_LIMIT = parseInt(process.env.API_RATE_LIMIT) || 200;
+const WRITE_RATE_LIMIT = parseInt(process.env.WRITE_RATE_LIMIT) || 50;
+
 // General API rate limiter (more permissive for user endpoints)
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 200, // Increased to 200 requests per 15 minutes
+  max: API_RATE_LIMIT,
   message: 'Too many requests from this IP, please try again later.',
   standardHeaders: true,
   legacyHeaders: false,
@@ -33,11 +36,13 @@ const apiLimiter = rateLimit({
 // Stricter rate limiter for write operations (POST/PUT/DELETE)
 const writeLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 50, // 50 write requests per 15 minutes
+  max: WRITE_RATE_LIMIT,
   message: 'Too many write requests from this IP, please try again later.',
   standardHeaders: true,
   legacyHeaders: false,
 });
+
+console.log(`🚦 Rate limits: API=${API_RATE_LIMIT}/15min, Write=${WRITE_RATE_LIMIT}/15min`);
 
 // Apply general rate limiter to all routes by default
 // But skip rate limiting for oracle/cron endpoints (they have their own auth)
@@ -143,9 +148,16 @@ const MARKET_DURATION_HOURS = 24; // Markets last 24 hours
 
 // ============ Twitter Integration ============
 
-// Cache for tweet metrics (10 minute TTL)
+// Cache for tweet metrics (configurable TTL)
 const metricsCache = new Map();
-const CACHE_TTL = 10 * 60 * 1000; // 10 minutes
+const CACHE_TTL_MINUTES = parseInt(process.env.METRICS_CACHE_TTL_MINUTES) || 10;
+const CACHE_TTL = CACHE_TTL_MINUTES * 60 * 1000;
+console.log(`📦 Tweet metrics cache TTL: ${CACHE_TTL_MINUTES} minutes`);
+
+// Blacklist for markets with no bets (to avoid checking them repeatedly)
+// These markets cannot be resolved (contract reverts) so we skip them permanently
+const emptyMarketsBlacklist = new Set();
+console.log(`🚫 Empty markets blacklist initialized`);
 
 /**
  * Fetch recent tweets from monitored accounts
@@ -1168,7 +1180,8 @@ async function retryWithBackoff(fn, maxRetries = 3, baseDelay = 1000) {
  * Process promises in batches with limited concurrency
  * This prevents overwhelming the RPC with too many concurrent requests
  */
-async function batchProcess(items, processFn, batchSize = 5) {
+const DEFAULT_BATCH_SIZE = parseInt(process.env.BATCH_SIZE) || 5;
+async function batchProcess(items, processFn, batchSize = DEFAULT_BATCH_SIZE) {
   const results = [];
   for (let i = 0; i < items.length; i += batchSize) {
     const batch = items.slice(i, i + batchSize);
@@ -1181,6 +1194,7 @@ async function batchProcess(items, processFn, batchSize = 5) {
   }
   return results;
 }
+console.log(`⚡ Batch processing size: ${DEFAULT_BATCH_SIZE} markets/batch`);
 
 async function resolveExpiredMarkets() {
   console.log('🔮 Checking for expired markets...');
@@ -1193,15 +1207,23 @@ async function resolveExpiredMarkets() {
 
     console.log(`Found ${expiredMarketIds.length} expired markets`);
 
-    if (expiredMarketIds.length === 0) {
-      console.log('✅ No expired markets to resolve');
-      return { resolved: 0, errors: [] };
+    // Filter out blacklisted empty markets (markets with no bets that we've already checked)
+    const marketsToProcess = expiredMarketIds.filter(id => !emptyMarketsBlacklist.has(id.toString()));
+    const skippedCount = expiredMarketIds.length - marketsToProcess.length;
+
+    if (skippedCount > 0) {
+      console.log(`🚫 Skipping ${skippedCount} empty markets from blacklist (saves ${skippedCount * 2} RPC calls)`);
+    }
+
+    if (marketsToProcess.length === 0) {
+      console.log('✅ No markets to resolve (all are blacklisted empty markets)');
+      return { resolved: 0, errors: [], skipped: skippedCount };
     }
 
     // Process newest markets first (reverse order) - they're more likely to have bets
     // This prevents old empty markets from blocking newer ones with real bets
-    const sortedMarketIds = [...expiredMarketIds].reverse();
-    console.log(`Processing newest first: ${sortedMarketIds.slice(0, 5).map(id => id.toString()).join(', ')}...`);
+    const sortedMarketIds = [...marketsToProcess].reverse();
+    console.log(`Processing ${sortedMarketIds.length} markets (newest first): ${sortedMarketIds.slice(0, 5).map(id => id.toString()).join(', ')}...`);
 
     // With retry logic for rate limits, we can process more markets per run
     // Cron runs every 5 minutes, so we can process 5-7 markets per run safely
@@ -1250,9 +1272,10 @@ async function resolveExpiredMarkets() {
         
         const totalPool = market.yesPool.add(market.noPool);
 
-        // Skip markets with no bets
+        // Skip markets with no bets and add to blacklist
         if (totalPool.isZero()) {
-          console.log(`⏭️  Skipping Market #${marketId}: No bets placed`);
+          console.log(`⏭️  Market #${marketId}: No bets placed - Adding to blacklist`);
+          emptyMarketsBlacklist.add(marketId.toString());
           continue;
         }
 
@@ -1448,8 +1471,13 @@ async function resolveExpiredMarkets() {
       }
     }
 
-    const remaining = expiredMarketIds.length - resolvedCount;
-    console.log(`\n🎉 Resolution complete! Resolved: ${resolvedCount}, Errors: ${errors.length}, Remaining: ${remaining}`);
+    const remaining = marketsToProcess.length - resolvedCount;
+    console.log(`\n🎉 Resolution complete!`);
+    console.log(`   ✅ Resolved: ${resolvedCount}`);
+    console.log(`   ❌ Errors: ${errors.length}`);
+    console.log(`   ⏭️  Skipped (blacklist): ${skippedCount}`);
+    console.log(`   📊 Blacklist size: ${emptyMarketsBlacklist.size} markets`);
+    console.log(`   ⏳ Remaining to process: ${remaining}`);
     
     if (errors.length > 0) {
       const rateLimitErrors = errors.filter(e => e.isRateLimit).length;
@@ -1458,7 +1486,13 @@ async function resolveExpiredMarkets() {
       }
     }
     
-    return { resolved: resolvedCount, errors, remaining };
+    return {
+      resolved: resolvedCount,
+      errors,
+      remaining,
+      skipped: skippedCount,
+      blacklistSize: emptyMarketsBlacklist.size
+    };
   } catch (error) {
     console.error('Error resolving markets:', error);
     throw error;
@@ -2602,10 +2636,12 @@ app.get('/api/leaderboard', async (req, res) => {
       });
     }
 
-    // Default leaderboard view (sorted by win_rate descending)
+    // Default leaderboard view (sorted by total_wins first, then win_rate)
+    // This ensures people with more wins rank higher, even with slightly lower win rate
     const { data: leaderboard, error } = await supabase
       .from('leaderboard')
       .select('*')
+      .order('total_wins', { ascending: false })
       .order('win_rate', { ascending: false })
       .limit(100);
 
@@ -4011,6 +4047,60 @@ app.post('/api/admin/resolve-market', async (req, res) => {
 
   } catch (error) {
     console.error('Error resolving market:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+// ============ Empty Markets Blacklist Management ============
+
+/**
+ * GET /api/admin/blacklist - View blacklisted empty markets
+ */
+app.get('/api/admin/blacklist', async (req, res) => {
+  try {
+    res.json({
+      success: true,
+      blacklist: Array.from(emptyMarketsBlacklist),
+      size: emptyMarketsBlacklist.size,
+      description: 'Markets with no bets that cannot be resolved (skipped to save API calls)'
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      error: error.message
+    });
+  }
+});
+
+/**
+ * POST /api/admin/blacklist/clear - Clear blacklist (if markets get bets later)
+ */
+app.post('/api/admin/blacklist/clear', async (req, res) => {
+  try {
+    const { marketId } = req.body;
+
+    if (marketId !== undefined) {
+      // Clear specific market
+      const removed = emptyMarketsBlacklist.delete(marketId.toString());
+      res.json({
+        success: true,
+        message: removed ? `Market #${marketId} removed from blacklist` : `Market #${marketId} was not in blacklist`,
+        blacklistSize: emptyMarketsBlacklist.size
+      });
+    } else {
+      // Clear entire blacklist
+      const previousSize = emptyMarketsBlacklist.size;
+      emptyMarketsBlacklist.clear();
+      res.json({
+        success: true,
+        message: `Cleared ${previousSize} markets from blacklist`,
+        blacklistSize: 0
+      });
+    }
+  } catch (error) {
     res.status(500).json({
       success: false,
       error: error.message
