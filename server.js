@@ -1877,7 +1877,7 @@ app.get('/api/markets', async (req, res) => {
               console.error(`Error enriching market ${dbMarket.market_id}:`, err.message);
               return null;
             }
-          })
+          }
         );
 
         // Filter out null values (failed enrichments)
@@ -3833,7 +3833,7 @@ app.get('/api/admin/markets', async (req, res) => {
               console.error(`Error enriching market ${dbMarket.market_id}:`, err.message);
               return null;
             }
-          })
+          }
         );
 
         // Filter out null values (failed enrichments)
