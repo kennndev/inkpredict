@@ -73,26 +73,44 @@ if (ALCHEMY_API_KEY && ALCHEMY_RPC_URL) {
   // Use Alchemy provider for better performance
   // Use StaticJsonRpcProvider to avoid network detection issues
   console.log('🔮 Using Alchemy provider for enhanced performance');
-  provider = new ethers.providers.StaticJsonRpcProvider(ALCHEMY_RPC_URL, {
-    chainId: 763373,
-    name: 'ink-sepolia'
-  });
+  provider = new ethers.providers.StaticJsonRpcProvider(
+    {
+      url: ALCHEMY_RPC_URL,
+      timeout: 30000 // 30 second timeout (reduced from default 120s)
+    },
+    {
+      chainId: 763373,
+      name: 'ink-sepolia'
+    }
+  );
 } else {
   // Fallback to standard RPC
   // Use StaticJsonRpcProvider to avoid network detection issues
-  provider = new ethers.providers.StaticJsonRpcProvider(process.env.INK_CHAIN_RPC, {
-    chainId: 763373,
-    name: 'ink-sepolia'
-  });
+  provider = new ethers.providers.StaticJsonRpcProvider(
+    {
+      url: process.env.INK_CHAIN_RPC,
+      timeout: 30000 // 30 second timeout (reduced from default 120s)
+    },
+    {
+      chainId: 763373,
+      name: 'ink-sepolia'
+    }
+  );
 }
 
 // Metrics provider - can be mainnet or sepolia
 if (USE_MAINNET_FOR_METRICS && INK_CHAIN_MAINNET_RPC) {
   console.log('🌐 Using Ink Chain MAINNET for metrics fetching');
-  metricsProvider = new ethers.providers.StaticJsonRpcProvider(INK_CHAIN_MAINNET_RPC, {
-    chainId: INK_CHAIN_MAINNET_CHAIN_ID,
-    name: 'ink-mainnet'
-  });
+  metricsProvider = new ethers.providers.StaticJsonRpcProvider(
+    {
+      url: INK_CHAIN_MAINNET_RPC,
+      timeout: 30000 // 30 second timeout (reduced from default 120s)
+    },
+    {
+      chainId: INK_CHAIN_MAINNET_CHAIN_ID,
+      name: 'ink-mainnet'
+    }
+  );
 } else {
   console.log('🧪 Using Ink Chain SEPOLIA for metrics fetching');
   metricsProvider = provider; // Use same provider as contract
@@ -1118,21 +1136,50 @@ async function retryWithBackoff(fn, maxRetries = 3, baseDelay = 1000) {
     try {
       return await fn();
     } catch (error) {
-      const isRateLimit = error.message?.includes('429') || 
+      // Check for rate limit errors
+      const isRateLimit = error.message?.includes('429') ||
                          error.message?.includes('rate limit') ||
                          error.message?.includes('too many requests') ||
-                         error.code === 'ECONNRESET' ||
-                         error.code === 'ETIMEDOUT';
-      
-      if (isRateLimit && attempt < maxRetries - 1) {
+                         error.code === 'ECONNRESET';
+
+      // Check for timeout errors (both direct timeouts and call exceptions caused by timeouts)
+      const isTimeout = error.code === 'TIMEOUT' ||
+                       error.code === 'ETIMEDOUT' ||
+                       error.error?.code === 'TIMEOUT' ||
+                       error.message?.includes('timeout') ||
+                       (error.code === 'CALL_EXCEPTION' && error.error?.code === 'TIMEOUT');
+
+      // Retry on rate limits or timeouts
+      const shouldRetry = (isRateLimit || isTimeout) && attempt < maxRetries - 1;
+
+      if (shouldRetry) {
         const delay = baseDelay * Math.pow(2, attempt);
-        console.warn(`⚠️ Rate limit hit, retrying in ${delay}ms... (attempt ${attempt + 1}/${maxRetries})`);
+        const reason = isTimeout ? 'Timeout' : 'Rate limit';
+        console.warn(`⚠️ ${reason} error, retrying in ${delay}ms... (attempt ${attempt + 1}/${maxRetries})`);
         await new Promise(resolve => setTimeout(resolve, delay));
         continue;
       }
       throw error;
     }
   }
+}
+
+/**
+ * Process promises in batches with limited concurrency
+ * This prevents overwhelming the RPC with too many concurrent requests
+ */
+async function batchProcess(items, processFn, batchSize = 5) {
+  const results = [];
+  for (let i = 0; i < items.length; i += batchSize) {
+    const batch = items.slice(i, i + batchSize);
+    const batchResults = await Promise.all(batch.map(processFn));
+    results.push(...batchResults);
+    // Small delay between batches to avoid overwhelming the RPC
+    if (i + batchSize < items.length) {
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+  }
+  return results;
 }
 
 async function resolveExpiredMarkets() {
@@ -1780,12 +1827,16 @@ app.get('/api/markets', async (req, res) => {
         .order('created_at', { ascending: false });
 
       if (!error && dbMarkets && dbMarkets.length > 0) {
-        const enrichedMarkets = await Promise.all(
-          dbMarkets.map(async (dbMarket) => {
+        // Use batching to avoid overwhelming RPC (process 5 markets at a time)
+        const enrichedMarkets = await batchProcess(dbMarkets, async (dbMarket) => {
             try {
-              // Get blockchain data
-              const market = await contract.markets(dbMarket.market_id);
-              const [yesOdds, noOdds] = await contract.getOdds(dbMarket.market_id);
+              // Get blockchain data with retry logic
+              const market = await retryWithBackoff(async () => {
+                return await contract.markets(dbMarket.market_id);
+              }, 3, 2000);
+              const [yesOdds, noOdds] = await retryWithBackoff(async () => {
+                return await contract.getOdds(dbMarket.market_id);
+              }, 3, 2000);
 
               // Get current metrics
               let currentMetric = 0;
@@ -1840,9 +1891,13 @@ app.get('/api/markets', async (req, res) => {
     const markets = [];
 
     for (const marketId of activeMarketIds) {
-      const market = await contract.markets(marketId);
+      const market = await retryWithBackoff(async () => {
+        return await contract.markets(marketId);
+      }, 3, 2000);
       const metrics = await getTweetMetrics(market.tweetId);
-      const [yesOdds, noOdds] = await contract.getOdds(marketId);
+      const [yesOdds, noOdds] = await retryWithBackoff(async () => {
+        return await contract.getOdds(marketId);
+      }, 3, 2000);
 
       markets.push({
         id: market.id.toString(),
@@ -1889,8 +1944,12 @@ app.get('/api/market/:id', async (req, res) => {
       if (!error && dbMarket) {
         // Enrich with blockchain data
         try {
-          const market = await contract.markets(marketId);
-          const [yesOdds, noOdds] = await contract.getOdds(marketId);
+          const market = await retryWithBackoff(async () => {
+            return await contract.markets(marketId);
+          }, 3, 2000);
+          const [yesOdds, noOdds] = await retryWithBackoff(async () => {
+            return await contract.getOdds(marketId);
+          }, 3, 2000);
 
           // Get current metrics
           let currentMetric = 0;
@@ -1936,14 +1995,18 @@ app.get('/api/market/:id', async (req, res) => {
       }
     }
 
-    const market = await contract.markets(marketId);
+    const market = await retryWithBackoff(async () => {
+      return await contract.markets(marketId);
+    }, 3, 2000);
 
     if (market.deadline.toString() === '0') {
       return res.status(404).json({ success: false, error: 'Market not found' });
     }
 
     const metrics = await getTweetMetrics(market.tweetId);
-    const [yesOdds, noOdds] = await contract.getOdds(marketId);
+    const [yesOdds, noOdds] = await retryWithBackoff(async () => {
+      return await contract.getOdds(marketId);
+    }, 3, 2000);
 
     res.json({
       success: true,
@@ -2369,8 +2432,12 @@ app.get('/api/user/:address/bets', async (req, res) => {
     const bets = [];
 
     for (const marketId of marketIds) {
-      const market = await contract.markets(marketId);
-      const bet = await contract.bets(marketId, address);
+      const market = await retryWithBackoff(async () => {
+        return await contract.markets(marketId);
+      }, 3, 2000);
+      const bet = await retryWithBackoff(async () => {
+        return await contract.bets(marketId, address);
+      }, 3, 2000);
 
       bets.push({
         marketId: marketId.toString(),
@@ -3711,12 +3778,16 @@ app.get('/api/admin/markets', async (req, res) => {
 
       if (!error && dbMarkets && dbMarkets.length > 0) {
         // Enrich with blockchain data (pools, odds)
-        const enrichedMarkets = await Promise.all(
-          dbMarkets.map(async (dbMarket) => {
+        // Use batching to avoid overwhelming RPC (process 5 markets at a time)
+        const enrichedMarkets = await batchProcess(dbMarkets, async (dbMarket) => {
             try {
-              // Get blockchain data
-              const market = await contract.markets(dbMarket.market_id);
-              const [yesOdds, noOdds] = await contract.getOdds(dbMarket.market_id);
+              // Get blockchain data with retry logic
+              const market = await retryWithBackoff(async () => {
+                return await contract.markets(dbMarket.market_id);
+              }, 3, 2000);
+              const [yesOdds, noOdds] = await retryWithBackoff(async () => {
+                return await contract.getOdds(dbMarket.market_id);
+              }, 3, 2000);
 
               // Get current metrics
               let currentMetric = 0;
@@ -3776,11 +3847,15 @@ app.get('/api/admin/markets', async (req, res) => {
     const markets = [];
 
     for (let i = 0; i < marketCount; i++) {
-      const market = await contract.markets(i);
+      const market = await retryWithBackoff(async () => {
+        return await contract.markets(i);
+      }, 3, 2000);
       if (market.resolved) continue;
 
       const metrics = await getTweetMetrics(market.tweetId);
-      const [yesOdds, noOdds] = await contract.getOdds(i);
+      const [yesOdds, noOdds] = await retryWithBackoff(async () => {
+        return await contract.getOdds(i);
+      }, 3, 2000);
       const now = Math.floor(Date.now() / 1000);
       const isExpired = market.deadline.toNumber() < now;
 
@@ -3828,7 +3903,9 @@ app.post('/api/admin/resolve-market', async (req, res) => {
 
     console.log(`🔮 Manual resolution requested for market #${marketId}`);
 
-    const market = await contract.markets(marketId);
+    const market = await retryWithBackoff(async () => {
+      return await contract.markets(marketId);
+    }, 3, 2000);
 
     if (market.resolved) {
       return res.status(400).json({
